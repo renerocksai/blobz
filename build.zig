@@ -5,14 +5,15 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
-    const lib_mod = b.createModule(.{
+    // we export this module
+    const lib_mod = b.addModule("blobz", .{
         .root_source_file = b.path("src/blobz.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("internal/main.zig"),
         .target = target,
         .optimize = optimize,
     });
