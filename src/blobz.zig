@@ -7,16 +7,34 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const log = std.log.scoped(.blobz);
+
 pub const Opts = struct {
+    initial_capacity: usize,
     save_interval_seconds: usize,
     prefix: []const u8,
     workdir: []const u8,
 
     pub const default: Opts = .{
+        .initial_capacity = 1000,
         .save_interval_seconds = 10,
-        .prefix = "objectstore",
-        .workdir = ".",
+        .prefix = "default",
+        .workdir = "object_store",
     };
+
+    pub fn format(
+        self: Opts,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print(
+            ".{{.initial_capacity = {d}, .save_interval_seconds = {d}, .prefix = \"{s}\", .workdir = \"{s}\" }}",
+            .{ self.initial_capacity, self.save_interval_seconds, self.prefix, self.workdir },
+        );
+    }
 };
 
 /// Create the Blobz object store.
@@ -27,49 +45,71 @@ pub const Opts = struct {
 /// Values that you read
 pub fn Store(K: type, V: type) type {
     return struct {
-        _kv_store: std.AutoArrayHashMapUnmanaged(K, Wrap(V)) = .empty,
+        opts: Opts = .default,
+        dest_path: []const u8,
+
+        _kv_store: std.AutoArrayHashMapUnmanaged(K, Wrap(V)),
         // dang. wish zig's hashmaps were threadsafe
         _insert_mutex: std.Thread.Mutex = .{},
 
         pub const Self = @This();
-        pub const RetrieveMode = enum { reading, writing };
+
+        pub fn format(
+            self: *const Self,
+            comptime fmt: []const u8,
+            options: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = fmt;
+            _ = options;
+            try writer.print(
+                ".{{ .opts = {}, .dest_path = \"{s}\", ._kv_store={{.count = {d}, .capacity = {d}}}, }}",
+                .{ self.opts, self.dest_path, self._kv_store.count(), self._kv_store.capacity() },
+            );
+        }
+
+        pub fn init(gpa: Allocator, opts: Opts) !Self {
+            // create the directory for the store
+            const dest_path = try std.fs.path.join(gpa, &.{ opts.workdir, opts.prefix });
+            std.fs.cwd().makePath(dest_path) catch |err| {
+                log.err("Unable to create destination path `{s}`: {}", .{ dest_path, err });
+                return err;
+            };
+
+            var ret: Self = .{
+                .opts = opts,
+                .dest_path = dest_path,
+                ._kv_store = .empty,
+            };
+            try ret.ensureCapacity(gpa, opts.initial_capacity);
+            return ret;
+        }
+
+        pub fn deinit(self: *Self, gpa: Allocator) void {
+            gpa.free(self.dest_path);
+            self._kv_store.deinit(gpa);
+        }
 
         /// Return value of the Blobz store
         /// It contains a pointer to the retrieved value associated with the key.
         /// It is already read-locked when it is returned to you.
-        /// You must call ReadValue.unlock() when finished:
-        ///
-        /// ```zig
-        /// const alloc = std.testing.allocator;
-        ///
-        /// var store : Blobz.Store([]const u8, usize) = .{};
-        /// try store.put(alloc, 0, 1000);
-        ///
-        /// const v = store.getValuePtrLocked(0) orelse unreachable;
-        /// defer v.unlock();
-        ///
-        /// std.debug.print("Value is: {d}\n", .{ v.value_ptr.* });
-        /// ```
+        /// You must call ReadValue.unlock() when finished.
         pub const RetrievedValue = struct {
             _rw_mode: RetrieveMode,
             _lock: *std.Thread.RwLock,
             value_ptr: *V,
 
             pub fn unlock(self: *RetrievedValue) void {
-                if (self._rw_mode == .reading) {
-                    self._lock.unlockShared();
-                } else {
-                    self._lock.unlock();
+                switch (self._rw_mode) {
+                    .reading => self._lock.unlockShared(),
+                    .writing => self._lock.unlock(),
                 }
             }
         };
+        pub const RetrieveMode = enum { reading, writing };
 
-        pub fn ensureCapacity(self: *Self, alloc: Allocator, capacity: usize) !void {
-            self._kv_store.ensureTotalCapacity(alloc, capacity);
-        }
-
-        pub fn deinit(self: *Self, alloc: Allocator) void {
-            self._kv_store.deinit(alloc);
+        pub fn ensureCapacity(self: *Self, gpa: Allocator, capacity: usize) !void {
+            try self._kv_store.ensureTotalCapacity(gpa, capacity);
         }
 
         /// call .unlock() on the returned RetrievedValue wrapper
@@ -79,10 +119,9 @@ pub fn Store(K: type, V: type) type {
             self._insert_mutex.lock();
             defer self._insert_mutex.unlock();
             if (self._kv_store.getPtr(k)) |wrapped_ptr| {
-                if (rw_mode == .reading) {
-                    wrapped_ptr._rw_lock.lockShared();
-                } else {
-                    wrapped_ptr._rw_lock.lock();
+                switch (rw_mode) {
+                    .reading => wrapped_ptr._rw_lock.lockShared(),
+                    .writing => wrapped_ptr._rw_lock.lock(),
                 }
                 return .{
                     ._lock = &wrapped_ptr._rw_lock,
@@ -104,13 +143,13 @@ pub fn Store(K: type, V: type) type {
         ///
         /// if you modified a value returned by getValueFor(..., .writing),
         /// then make sure you call value.unlock() before calling upsert
-        pub fn upsert(self: *Self, alloc: Allocator, key: K, value: V) !void {
+        pub fn upsert(self: *Self, gpa: Allocator, key: K, value: V) !void {
 
             // TODO: check if we can get away without
             self._insert_mutex.lock();
             defer self._insert_mutex.unlock();
 
-            const gopResult = try self._kv_store.getOrPut(alloc, key);
+            const gopResult = try self._kv_store.getOrPut(gpa, key);
             if (gopResult.found_existing) {
                 // we need to replace
                 // prevent reading and writing from/to this value while we replace
@@ -181,15 +220,14 @@ pub fn Wrap(V: type) type {
     };
 }
 
-test "1" {
-    const o: Opts = .default;
-    std.debug.print("Opts: {}\n", .{o});
-}
-
 test "2" {
     const alloc = std.testing.allocator;
-    var store: Store(usize, usize) = .{};
+
+    var store = try Store(usize, usize).init(alloc, .default);
     defer store.deinit(alloc);
+
+    std.debug.print("The store is: {}\n", .{store});
+
     const key: usize = 1;
     try store.upsert(alloc, key, 1000);
 
@@ -198,7 +236,7 @@ test "2" {
     std.debug.print("Value v is: {d}\n", .{v.value_ptr.*});
 
     var vv = store.getValueFor(key, .reading) orelse unreachable;
-    std.debug.print("NO DEADLOCK!!!", .{});
+    std.debug.print("NO DEADLOCK!!!\n", .{});
     defer vv.unlock();
     std.debug.print("Value vv is: {d}\n", .{vv.value_ptr.*});
 }
