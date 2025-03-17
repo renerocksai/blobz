@@ -68,6 +68,24 @@ pub fn Store(K: type, V: type) type {
             );
         }
 
+        /// Return value of the Blobz store
+        /// It contains a pointer to the retrieved value associated with the key.
+        /// It is already read-locked when it is returned to you.
+        /// You must call ReadValue.unlock() when finished.
+        pub const RetrievedValue = struct {
+            _rw_mode: RetrieveMode,
+            _lock: *std.Thread.RwLock,
+            value_ptr: *V,
+
+            pub fn unlock(self: *RetrievedValue) void {
+                switch (self._rw_mode) {
+                    .reading => self._lock.unlockShared(),
+                    .writing => self._lock.unlock(),
+                }
+            }
+        };
+        pub const RetrieveMode = enum { reading, writing };
+
         pub fn init(gpa: Allocator, opts: Opts) !Self {
             // create the directory for the store
             const dest_path = try std.fs.path.join(gpa, &.{ opts.workdir, opts.prefix });
@@ -89,24 +107,6 @@ pub fn Store(K: type, V: type) type {
             gpa.free(self.dest_path);
             self._kv_store.deinit(gpa);
         }
-
-        /// Return value of the Blobz store
-        /// It contains a pointer to the retrieved value associated with the key.
-        /// It is already read-locked when it is returned to you.
-        /// You must call ReadValue.unlock() when finished.
-        pub const RetrievedValue = struct {
-            _rw_mode: RetrieveMode,
-            _lock: *std.Thread.RwLock,
-            value_ptr: *V,
-
-            pub fn unlock(self: *RetrievedValue) void {
-                switch (self._rw_mode) {
-                    .reading => self._lock.unlockShared(),
-                    .writing => self._lock.unlock(),
-                }
-            }
-        };
-        pub const RetrieveMode = enum { reading, writing };
 
         pub fn ensureCapacity(self: *Self, gpa: Allocator, capacity: usize) !void {
             try self._kv_store.ensureTotalCapacity(gpa, capacity);
