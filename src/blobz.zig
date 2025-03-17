@@ -49,10 +49,14 @@ pub fn Store(K: type, V: type) type {
         dest_path: []const u8,
 
         _kv_store: std.AutoArrayHashMapUnmanaged(K, Wrap(V)),
+
         // dang. wish zig's hashmaps were threadsafe
         _insert_mutex: std.Thread.Mutex = .{},
 
-        pub const Self = @This();
+        pub const Key_Type: type = K;
+        pub const Value_Type: type = V;
+
+        const Self = @This();
 
         pub fn format(
             self: *const Self,
@@ -207,6 +211,7 @@ pub fn Store(K: type, V: type) type {
     };
 }
 
+// TODO: re-think this. Does it make values unnecessary large?
 pub fn Wrap(V: type) type {
     return struct {
         _rw_lock: std.Thread.RwLock = .{},
