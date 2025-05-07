@@ -4,6 +4,8 @@
 //! Retrieved values always hold a lock: either for .reading or for .writing.
 //!
 
+pub const version = @import("version.zig").version() orelse "(unknown version)";
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -231,7 +233,7 @@ test "2" {
     var store = try Store(usize, usize).init(alloc, .default);
     defer store.deinit(alloc);
 
-    std.debug.print("The store is: {}\n", .{store});
+    std.debug.print("The store is: {} (v{s})\n", .{ store, version });
 
     const key: usize = 1;
     try store.upsert(alloc, key, 1000);

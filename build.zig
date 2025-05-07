@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const build_zig_zon = @embedFile("build.zig.zon");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
@@ -12,14 +14,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("internal/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    exe_mod.addImport("blobz_lib", lib_mod);
-
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "blobz",
@@ -28,23 +22,35 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lib);
 
-    const exe = b.addExecutable(.{
-        .name = "blobz",
-        .root_module = exe_mod,
-    });
+    // Make build.zig.zon accessible in module
+    var my_options = std.Build.Step.Options.create(b);
+    my_options.addOption([]const u8, "contents", build_zig_zon);
+    lib.root_module.addOptions("build.zig.zon", my_options);
 
-    b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
+    // const exe_mod = b.createModule(.{
+    //     .root_source_file = b.path("examples/blah/main.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+    //
+    // exe_mod.addImport("blobz", lib_mod);
+    // const exe = b.addExecutable(.{
+    //     .name = "blobz",
+    //     .root_module = exe_mod,
+    // });
+    //
+    // b.installArtifact(exe);
+    //
+    // const run_cmd = b.addRunArtifact(exe);
+    //
+    // run_cmd.step.dependOn(b.getInstallStep());
+    //
+    // if (b.args) |args| {
+    //     run_cmd.addArgs(args);
+    // }
+    //
+    // const run_step = b.step("run", "Run the app");
+    // run_step.dependOn(&run_cmd.step);
 
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_mod,
@@ -52,19 +58,13 @@ pub fn build(b: *std.Build) void {
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
+    // TODO: ATM, this module isn't used by the lib, so we test it separately
     const persist_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/persist.zig"),
     });
     const run_persist_unit_tests = b.addRunArtifact(persist_unit_tests);
 
-    const exe_unit_tests = b.addTest(.{
-        .root_module = exe_mod,
-    });
-
-    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
-
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
-    test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(&run_persist_unit_tests.step);
 }
