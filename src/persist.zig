@@ -41,8 +41,8 @@ pub const Config = struct {
     }
 };
 
-/// NumericKeyPersistor forms the core of our implementation. It uses a numeric ID
-/// type. If you need arbitrary IDs, use the generic Persistor (further
+/// NumericKeyPersistor forms the core of our implementation. It uses a numeric
+/// ID type. If you need arbitrary IDs, use the generic Persistor (further
 /// down) instead.
 pub fn NumericKeyPersistor(comptime ID: type, Value: type) type {
     // Assume ID is an unsigned integer.
@@ -55,7 +55,7 @@ pub fn NumericKeyPersistor(comptime ID: type, Value: type) type {
     return struct {
         // Compute the number of hex digits from the bit-size.
         pub const bit_size = @bitSizeOf(ID);
-        pub const num_hex_digits = bit_size / 4; // e.g. u64: 64/4 = 16, u128: 128/4 = 32
+        pub const num_hex_digits = bit_size / 4;
 
         pub const Self = @This();
 
@@ -74,7 +74,10 @@ pub fn NumericKeyPersistor(comptime ID: type, Value: type) type {
             // Create a fixed buffer to hold the hex representation.
             var key_buf: [num_hex_digits]u8 = undefined;
             const format_string = std.fmt.comptimePrint("{{x:0>{d}}}", .{num_hex_digits});
-            // std.debug.print("format_string for {s} {d} digits: {s}", .{ @typeName(ID), num_hex_digits, format_string });
+            // std.debug.print(
+            //     "format_string for {s} {d} digits: {s}",
+            //     .{ @typeName(ID), num_hex_digits, format_string },
+            // );
             const key_hex = try std.fmt.bufPrint(&key_buf, format_string, .{id});
 
             // Each level uses (bits_per_level / 4) hex digits.
@@ -188,7 +191,7 @@ pub fn Hasher(K: type, ID: type) type {
 /// If key is NOT numeric, its hash is used --> order is not preserved!
 pub fn Persistor(comptime K: type, V: type) type {
     comptime {
-        if (!meta.isInteger(K) and !meta.isSlice(K)) {
+        if (!meta.isInteger(K) and !meta.isSliceOf(K, u8)) {
             @compileError("Persistor<K> only supports integer or []const u8 keys");
             // TODO: check if slice is of type []const u8
         }
@@ -206,11 +209,12 @@ pub fn Persistor(comptime K: type, V: type) type {
         const DiskPayload = if (is_int) V else KV;
 
         const Self = @This();
+        const NumIdPersistor = NumericKeyPersistor(ID, DiskPayload);
 
-        persistor: NumericKeyPersistor(ID, V),
+        persistor: NumIdPersistor,
 
         pub fn init(config: Config) Self {
-            return .{ .persistor = NumericKeyPersistor(ID, V).init(config) };
+            return .{ .persistor = NumIdPersistor.init(config) };
         }
 
         pub fn persist(self: *Self, gpa: std.mem.Allocator, key: K, value: V) !void {
@@ -219,12 +223,18 @@ pub fn Persistor(comptime K: type, V: type) type {
             try self.persistor.persist(gpa, id, payload);
         }
 
+        pub fn hash(_: *Self, key: K) ID {
+            return hasher.hash(key);
+        }
+
         /// You know the key, so load and return only the value
         pub fn load(self: *Self, arena: std.mem.Allocator, key: K) !V {
             const id: ID = hasher.hash(key);
             const obj = try self.persistor.load(arena, id);
             if (is_int) return obj else {
-                if (obj.key != key) {
+
+                // key comparison of u8 slices
+                if (!std.mem.eql(u8, obj.key, key)) {
                     return error.HashCollision;
                 }
                 return obj.value;
@@ -289,6 +299,74 @@ test Persistor {
     defer read_value_2.deinit(arena);
     try std.testing.expectEqualStrings(value_2.first_name, read_value_2.first_name);
     try std.testing.expectEqualStrings(value_2.last_name, read_value_2.last_name);
+
+    try std.fs.cwd().deleteTree(BASE_PATH);
+}
+
+test "Hashing Persistor" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const KEY_TYPE = []const u8;
+    const BASE_PATH = ",,test_hashing_persistor";
+
+    const config = Config.initDefault(KEY_TYPE, BASE_PATH);
+
+    const Value = struct {
+        my_key_field: []const u8,
+        first_name: []const u8,
+        last_name: []const u8,
+
+        pub fn deinit(self: *const @This(), allocator: Allocator) void {
+            allocator.free(self.my_key_field);
+            allocator.free(self.first_name);
+            allocator.free(self.last_name);
+        }
+    };
+
+    var persistor = Persistor(KEY_TYPE, Value).init(config);
+
+    // value 1
+    {
+        const value_1: Value = .{ .my_key_field = "user 1", .first_name = "rene", .last_name = "rocksai" };
+
+        try persistor.persist(gpa, value_1.my_key_field, value_1);
+
+        const file_1_hash = persistor.hash(value_1.my_key_field);
+        const file_1_hash_str = try std.fmt.allocPrint(gpa, "{x:0}", .{file_1_hash});
+        defer gpa.free(file_1_hash_str);
+        try std.testing.expectEqualStrings("31473c89de0732bc", file_1_hash_str);
+
+        const file_1_path = try persistor.persistor.filePath(gpa, file_1_hash);
+        defer gpa.free(file_1_path);
+        try std.testing.expectEqualStrings(BASE_PATH ++ "/31/47/3c/89/31473c89de0732bc.json", file_1_path);
+
+        const read_value_1 = try persistor.load(arena, value_1.my_key_field);
+        defer read_value_1.deinit(arena);
+        try std.testing.expectEqualStrings(value_1.first_name, read_value_1.first_name);
+        try std.testing.expectEqualStrings(value_1.last_name, read_value_1.last_name);
+    }
+
+    // value 2
+    {
+        const value_2: Value = .{ .my_key_field = "user 2", .first_name = "your", .last_name = "mom" };
+        try persistor.persist(gpa, value_2.my_key_field, value_2);
+        const file_2_hash = persistor.hash(value_2.my_key_field);
+        const file_2_hash_str = try std.fmt.allocPrint(gpa, "{x:0}", .{file_2_hash});
+        defer gpa.free(file_2_hash_str);
+        try std.testing.expectEqualStrings("8257bdc0e590ad97", file_2_hash_str);
+
+        const file_2_path = try persistor.persistor.filePath(gpa, file_2_hash);
+        defer gpa.free(file_2_path);
+        try std.testing.expectEqualStrings(BASE_PATH ++ "/82/57/bd/c0/8257bdc0e590ad97.json", file_2_path);
+
+        const read_value_2 = try persistor.load(arena, value_2.my_key_field);
+        defer read_value_2.deinit(arena);
+        try std.testing.expectEqualStrings(value_2.first_name, read_value_2.first_name);
+        try std.testing.expectEqualStrings(value_2.last_name, read_value_2.last_name);
+    }
 
     try std.fs.cwd().deleteTree(BASE_PATH);
 }

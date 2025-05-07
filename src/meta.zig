@@ -12,3 +12,14 @@ pub fn isSlice(T: type) bool {
         else => return false,
     }
 }
+
+pub fn isSliceOf(T: type, Of: type) bool {
+    switch (@typeInfo(T)) {
+        .pointer => |ptr_info| {
+            if (ptr_info.size == .slice) {
+                return ptr_info.child == Of;
+            }
+        },
+        else => return false,
+    }
+}
