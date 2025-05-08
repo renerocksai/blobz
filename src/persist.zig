@@ -205,7 +205,7 @@ pub fn Persistor(comptime K: type, V: type) type {
         const ID = if (is_int) K else u64;
         const hasher: Hasher(K, ID) = if (is_int) .identity else .hashing;
 
-        const KV = struct { key: K, value: V };
+        pub const KV = struct { key: K, value: V };
         const DiskPayload = if (is_int) V else KV;
 
         const Self = @This();

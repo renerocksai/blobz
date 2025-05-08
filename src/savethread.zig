@@ -1,6 +1,6 @@
 const std = @import("std");
 const blobz = @import("blobz.zig");
-const Persistor = @import("persist.zig");
+const persist = @import("persist.zig");
 
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -186,8 +186,8 @@ pub fn SaveThread(K: type, V: type) type {
                 //
                 // so, let's start with initializing the persistor
 
-                const config = Persistor.Config.initDefault(K, self.blobz_store.dest_path);
-                var persistor = Persistor.Persistor(K, V).init(config);
+                const config = persist.Config.initDefault(K, self.blobz_store.dest_path);
+                var persistor = persist.Persistor(K, V).init(config);
                 var num_saved: usize = 0;
 
                 for (dirty_values.items) |dirty_item| {
@@ -228,7 +228,7 @@ pub fn SaveThread(K: type, V: type) type {
 }
 
 // let's test this
-test Persistor {
+test SaveThread {
     const fsutils = @import("fsutils.zig");
 
     const alloc = std.testing.allocator;
