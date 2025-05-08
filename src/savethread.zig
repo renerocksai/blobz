@@ -7,6 +7,8 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 pub const Opts = struct {
     sleep_time_ms: usize = 250,
+    locking_spin_time_ms: usize = 2,
+    locking_spin_max_count: usize = 5,
 };
 
 const log = std.log.scoped(.save_thread);
@@ -14,6 +16,8 @@ const log = std.log.scoped(.save_thread);
 pub fn SaveThread(K: type, V: type) type {
     return struct {
         save_interval_seconds: usize,
+        locking_spin_time_ms: usize,
+        locking_spin_max_count: usize,
         sleep_time_ms: usize,
         blobz_store: *blobz.Store(K, V),
 
@@ -34,6 +38,8 @@ pub fn SaveThread(K: type, V: type) type {
                 .blobz_store = blobz_store,
                 .save_interval_seconds = blobz_store.opts.save_interval_seconds,
                 .sleep_time_ms = opts.sleep_time_ms,
+                .locking_spin_time_ms = opts.locking_spin_time_ms,
+                .locking_spin_max_count = opts.locking_spin_max_count,
             };
         }
 
@@ -103,14 +109,34 @@ pub fn SaveThread(K: type, V: type) type {
 
                     while (it.next()) |entry| {
                         if (entry.value_ptr._dirty_time > entry.value_ptr._collection_time) {
-                            // FIXME: we SHOULD spin or "soft-spin" (with
-                            //        sleep) here with tryLock() and give up if
-                            //        it takes too long.
-                            entry.value_ptr._rw_lock.lock();
+                            // we "soft-spin" (with sleep) here with tryLock()
+                            // and give up if it takes too long.
+                            var locking_spin_count: usize = 0;
+                            const is_locked: bool = blk: {
+                                while (!entry.value_ptr._rw_lock.tryLock()) {
+                                    locking_spin_count += 1;
+                                    if (locking_spin_count >= self.locking_spin_max_count) {
+                                        break :blk false;
+                                    }
+                                    std.time.sleep(self.locking_spin_time_ms);
+                                }
+                                break :blk true;
+                            };
+
+                            if (!is_locked) {
+                                log.warn(
+                                    "Item with key {any} could not be locked -> giving it up!",
+                                    .{entry.key_ptr.*},
+                                );
+                                continue;
+                            }
 
                             entry.value_ptr._collection_time = collection_time;
                             dirty_values.append(arena, .{ .key_ptr = entry.key_ptr, .wrapped_ptr = entry.value_ptr }) catch |err| {
-                                log.err("Unable to insert into dirty_list! {}", .{err});
+                                log.err(
+                                    "Unable to insert item with key {any} into dirty_list! {}",
+                                    .{ entry.key_ptr.*, err },
+                                );
                                 // try later
                                 break;
                             };
@@ -146,8 +172,8 @@ pub fn SaveThread(K: type, V: type) type {
                             continue;
                         };
                         log.err(
-                            "Unable to persist value to {s}: {}",
-                            .{ file_path, err },
+                            "Unable to persist value with key {any} to {s}: {}",
+                            .{ dirty_item.key_ptr.*, file_path, err },
                         );
                         continue;
                     };
@@ -169,3 +195,5 @@ pub fn SaveThread(K: type, V: type) type {
 }
 
 // let's test this
+//
+// try a combination of the blobz test and the persistor test
