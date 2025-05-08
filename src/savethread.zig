@@ -263,7 +263,7 @@ test Persistor {
 
     // some values
     const value_1: Value = .{ .first_name = "rene", .last_name = "rocksai" };
-    const value_2: Value = .{ .first_name = "your", .last_name = "mom" };
+    var value_2: Value = .{ .first_name = "your", .last_name = "mom" };
 
     // start a save thread
     var t = SaveThread(KEY_TYPE, Value).init(alloc, &store, .{
@@ -294,4 +294,20 @@ test Persistor {
     try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
     try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
     try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
+
+    // time step 4: update a value, and check if its file contents reflect the change
+    value_2.first_name = "my";
+    try store.upsert(alloc, 2, value_2);
+    std.time.sleep(store.opts.save_interval_seconds * std.time.ns_per_s);
+    try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
+    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
+    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
+    var file = try std.fs.cwd().openFile(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json", .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(alloc, 1024);
+    defer alloc.free(content);
+    var parsed = try std.json.parseFromSlice(Value, alloc, content, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("my", parsed.value.first_name);
+    try std.testing.expectEqualStrings("mom", parsed.value.last_name);
 }
