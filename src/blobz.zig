@@ -5,6 +5,7 @@
 //!
 
 pub const version = @import("version.zig").version() orelse "(unknown version)";
+pub const SaveThread = @import("savethread.zig").SaveThread;
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,7 +15,11 @@ const log = std.log.scoped(.blobz);
 pub const Opts = struct {
     initial_capacity: usize,
     save_interval_seconds: usize,
+    /// The "prefix" or name of this very object store inside the working
+    /// directory.
     prefix: []const u8,
+    /// The working directory. Subdirs will be created from here on, starting
+    /// with the `prefix` subdir.
     workdir: []const u8,
 
     pub const default: Opts = .{
@@ -57,6 +62,7 @@ pub fn Store(K: type, V: type) type {
 
         pub const Key_Type: type = K;
         pub const Value_Type: type = V;
+        pub const WrappedValue_Type: type = Wrap(V);
 
         const Self = @This();
 

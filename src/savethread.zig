@@ -1,0 +1,171 @@
+const std = @import("std");
+const blobz = @import("blobz.zig");
+const Persistor = @import("persist.zig");
+
+const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
+
+pub const Opts = struct {
+    sleep_time_ms: usize = 250,
+};
+
+const log = std.log.scoped(.save_thread);
+
+pub fn SaveThread(K: type, V: type) type {
+    return struct {
+        save_interval_seconds: usize,
+        sleep_time_ms: usize,
+        blobz_store: *blobz.Store(K, V),
+
+        thread: std.Thread = undefined,
+        exit_signal: std.Thread.ResetEvent = .{},
+
+        last_save_time: i128 = 0,
+
+        arena_state: ArenaAllocator,
+
+        const Self = @This();
+        const WrappedValue = blobz.Store(K, V).WrappedValue_Type;
+        const DirtyItem = struct { key_ptr: *const K, wrapped_ptr: *const WrappedValue };
+
+        pub fn init(allocator: Allocator, blobz_store: *blobz.Store(K, V), opts: Opts) Self {
+            return .{
+                .arena_state = ArenaAllocator.init(allocator),
+                .blobz_store = blobz_store,
+                .save_interval_seconds = blobz_store.opts.save_interval_seconds,
+                .sleep_time_ms = opts.sleep_time_ms,
+            };
+        }
+
+        pub fn start(self: *Self) void {
+            self.thread = try std.Thread.spawn(.{}, Self.thread_main, .{self});
+        }
+
+        pub fn stop(self: *Self) void {
+            self.exit_signal.set();
+        }
+
+        pub fn stopAndWait(self: *Self) void {
+            self.exit_signal.set();
+            self.thread.join();
+        }
+
+        fn thread_main(self: *Self) !void {
+            const arena = self.arena_state.allocator();
+
+            while (!self.exit_signal.isSet()) {
+                // delay so we don't hog the CPU
+                _ = self.arena_state.reset(.retain_capacity); // we don't care if it went OK
+                std.time.sleep(self.sleep_time_ms * std.time.ns_per_ms);
+
+                const collection_time = std.time.nanoTimestamp();
+                var dirty_values = std.ArrayListUnmanaged(DirtyItem).empty;
+
+                // iterate over all blobz objects and
+                {
+                    // stop the world - before doing anything else
+                    // FIXME: don't stop the world
+                    try self.blobz_store._insert_mutex.lock();
+                    defer self.blobz_store._insert_mutex.unlock();
+
+                    // find the dirty ones and:
+                    //      - record, in a list, their addresses which is safe
+                    //        because they can't be deleted from the blobz
+                    //        store while the _insert_mutex is held.
+                    //
+                    //        Note that we currently don't even support
+                    //        deleting values in the blobz store anyway!
+                    //
+                    //      - acquire their write locks so they are protected
+                    //        from modification and deletion (which we don't
+                    //        support anyway).
+                    //
+                    //        This assumes that a future delete operation would
+                    //        wait on the value's rw lock before deletion and
+                    //        subsequent potential destruction to ensure no
+                    //        write / modify-transaction is currently underway.
+                    //
+                    //        Note: some expensive "upsert" or rather
+                    //        getValueFor(.writing) transaction even of a
+                    //        single value could delay this entire
+                    //        stop-the-world operation.
+                    //
+                    //      - speaking of deletion: we should probably just
+                    //        append to a `free`-list and do the deletion
+                    //        *here*? Which would upgrade this thread from a
+                    //        mere saving thread to a maintenance thread.
+                    //
+                    //      - By using a free-list, we don't need as much
+                    //        locking; at least, that is the idea.
+                    //
+
+                    var it = self.blobz_store._kv_store.iterator();
+
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr._dirty_time > entry.value_ptr._collection_time) {
+                            // FIXME: we SHOULD spin or "soft-spin" (with
+                            //        sleep) here with tryLock() and give up if
+                            //        it takes too long.
+                            entry.value_ptr._rw_lock.lock();
+
+                            entry.value_ptr._collection_time = collection_time;
+                            dirty_values.append(arena, .{ .key_ptr = entry.key_ptr, .wrapped_ptr = entry.value_ptr }) catch |err| {
+                                log.err("Unable to insert into dirty_list! {}", .{err});
+                                // try later
+                                break;
+                            };
+                        }
+                    }
+                }
+
+                //
+                // _insert_mutex is now unlocked. world can continue.
+                //
+
+                // now we can safely iterate over the dirty_list and "slowly"
+                // persist them :-)
+                // then, release their _rw_lock
+                //
+                // so, let's start with initializing the persistor
+
+                const config = Persistor.Config.initDefault(K, self.blobz_store.dest_path);
+                var persistor = Persistor.Persistor(K, V).init(config);
+                var num_saved: usize = 0;
+
+                for (dirty_values.items) |dirty_item| {
+                    // !!!
+                    defer dirty_item.wrapped_ptr._rw_lock.unlock();
+                    // !!!
+
+                    persistor.persist(arena, dirty_item.key_ptr.*, dirty_item.wrapped_ptr.value) catch |err| {
+                        const file_path = persistor.persistor.filePath(arena, dirty_item.key_ptr.*) catch |suberr| {
+                            log.err(
+                                "Unable to save, unable to get path for key {any}: {}",
+                                .{ dirty_item.key_ptr.*, suberr },
+                            );
+                            continue;
+                        };
+                        log.err(
+                            "Unable to persist value to {s}: {}",
+                            .{ file_path, err },
+                        );
+                        continue;
+                    };
+                    num_saved += 1;
+                }
+
+                if (num_saved > 0) {
+                    log.info(
+                        "Saved {} out of {} dirty values",
+                        .{ num_saved, dirty_values.items.len },
+                    );
+                }
+
+                // end of big while loop
+            }
+            log.info("About to terminate", .{});
+        }
+    };
+}
+
+// let's test this
