@@ -239,23 +239,21 @@ pub fn Wrap(V: type) type {
     };
 }
 
-test Store {
+test "rw_lock: reading" {
     const alloc = std.testing.allocator;
 
     var store = try Store(usize, usize).init(alloc, .default);
     defer store.deinit(alloc);
-
-    std.debug.print("The store is: {} (v{s})\n", .{ store, version });
 
     const key: usize = 1;
     try store.upsert(alloc, key, 1000);
 
     var v = store.getValueFor(key, .reading) orelse unreachable;
     defer v.unlock();
-    std.debug.print("Value v is: {d}\n", .{v.value_ptr.*});
+    try std.testing.expectEqual(1000, v.value_ptr.*);
 
     var vv = store.getValueFor(key, .reading) orelse unreachable;
-    std.debug.print("NO DEADLOCK!!!\n", .{});
+    // std.debug.print("NO DEADLOCK!!!\n", .{});
     defer vv.unlock();
-    std.debug.print("Value vv is: {d}\n\n\n", .{vv.value_ptr.*});
+    try std.testing.expectEqual(1000, vv.value_ptr.*);
 }
