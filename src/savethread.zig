@@ -9,6 +9,18 @@ pub const Opts = struct {
     sleep_time_ms: usize = 250,
     locking_spin_time_ms: usize = 2,
     locking_spin_max_count: usize = 5,
+
+    /// if > 0, logs that the thread is alive every n milliseconds.
+    /// Note: the accuracy is influenced by:
+    ///       - sleep_time_ms
+    ///       - locking_spin_time_ms (and locking_spin_max_count)
+    ///       - the current persistor load
+    ///
+    ///       While the thread is sleeping or busy persisting, it won't be able
+    ///       to check whether it should log an alive message.
+    ///       For simplicity and to avoid unnecessary wakeups from sleep,
+    ///       logging is done in the thread's main loop.
+    log_alive_message_interval_ms: i64 = 0,
 };
 
 const log = std.log.scoped(.save_thread);
@@ -18,6 +30,7 @@ pub fn SaveThread(K: type, V: type) type {
         save_interval_seconds: usize,
         locking_spin_time_ms: usize,
         locking_spin_max_count: usize,
+        log_alive_message_interval_ms: i64,
         sleep_time_ms: usize,
         blobz_store: *blobz.Store(K, V),
 
@@ -30,7 +43,7 @@ pub fn SaveThread(K: type, V: type) type {
 
         const Self = @This();
         const WrappedValue = blobz.Store(K, V).WrappedValue_Type;
-        const DirtyItem = struct { key_ptr: *const K, wrapped_ptr: *const WrappedValue };
+        const DirtyItem = struct { key_ptr: *const K, wrapped_ptr: *WrappedValue };
 
         pub fn init(allocator: Allocator, blobz_store: *blobz.Store(K, V), opts: Opts) Self {
             return .{
@@ -40,10 +53,11 @@ pub fn SaveThread(K: type, V: type) type {
                 .sleep_time_ms = opts.sleep_time_ms,
                 .locking_spin_time_ms = opts.locking_spin_time_ms,
                 .locking_spin_max_count = opts.locking_spin_max_count,
+                .log_alive_message_interval_ms = opts.log_alive_message_interval_ms,
             };
         }
 
-        pub fn start(self: *Self) void {
+        pub fn start(self: *Self) !void {
             self.thread = try std.Thread.spawn(.{}, Self.thread_main, .{self});
         }
 
@@ -58,10 +72,19 @@ pub fn SaveThread(K: type, V: type) type {
 
         fn thread_main(self: *Self) !void {
             const arena = self.arena_state.allocator();
+            defer self.arena_state.deinit();
+
+            var last_alive_log_time: i64 = 0;
 
             while (!self.exit_signal.isSet()) {
-                // delay so we don't hog the CPU
                 _ = self.arena_state.reset(.retain_capacity); // we don't care if it went OK
+
+                if (std.time.milliTimestamp() + self.log_alive_message_interval_ms > last_alive_log_time) {
+                    log.info("alive.", .{});
+                    last_alive_log_time = std.time.milliTimestamp();
+                }
+
+                // delay so we don't hog the CPU
                 std.time.sleep(self.sleep_time_ms * std.time.ns_per_ms);
 
                 const collection_time = std.time.nanoTimestamp();
@@ -71,7 +94,7 @@ pub fn SaveThread(K: type, V: type) type {
                 {
                     // stop the world - before doing anything else
                     // FIXME: don't stop the world
-                    try self.blobz_store._insert_mutex.lock();
+                    self.blobz_store._insert_mutex.lock();
                     defer self.blobz_store._insert_mutex.unlock();
 
                     // find the dirty ones and:
@@ -108,7 +131,7 @@ pub fn SaveThread(K: type, V: type) type {
                     var it = self.blobz_store._kv_store.iterator();
 
                     while (it.next()) |entry| {
-                        if (entry.value_ptr._dirty_time > entry.value_ptr._collection_time) {
+                        if (entry.value_ptr._dirty_time >= entry.value_ptr._collection_time) {
                             // we "soft-spin" (with sleep) here with tryLock()
                             // and give up if it takes too long.
                             var locking_spin_count: usize = 0;
@@ -160,6 +183,7 @@ pub fn SaveThread(K: type, V: type) type {
 
                 for (dirty_values.items) |dirty_item| {
                     // !!!
+                    // !!! unlock the item when done!
                     defer dirty_item.wrapped_ptr._rw_lock.unlock();
                     // !!!
 
@@ -181,7 +205,7 @@ pub fn SaveThread(K: type, V: type) type {
                 }
 
                 if (num_saved > 0) {
-                    log.info(
+                    log.debug(
                         "Saved {} out of {} dirty values",
                         .{ num_saved, dirty_values.items.len },
                     );
@@ -189,11 +213,51 @@ pub fn SaveThread(K: type, V: type) type {
 
                 // end of big while loop
             }
-            log.info("About to terminate", .{});
+            log.debug("About to terminate", .{});
         }
     };
 }
 
 // let's test this
-//
-// try a combination of the blobz test and the persistor test
+test Persistor {
+    const alloc = std.testing.allocator;
+
+    const KEY_TYPE = u16;
+    const BASE_PATH = ",,test_persistor";
+
+    const Value = struct {
+        first_name: []const u8,
+        last_name: []const u8,
+
+        pub fn deinit(self: *const @This(), allocator: Allocator) void {
+            allocator.free(self.first_name);
+            allocator.free(self.last_name);
+        }
+    };
+
+    var store = try blobz.Store(KEY_TYPE, Value).init(alloc, .{
+        .prefix = "u16store",
+        .workdir = BASE_PATH,
+        .initial_capacity = 1000,
+        .save_interval_seconds = 5,
+    });
+    defer store.deinit(alloc);
+
+    const value_1: Value = .{ .first_name = "rene", .last_name = "rocksai" };
+    const value_2: Value = .{ .first_name = "your", .last_name = "mom" };
+
+    var t = SaveThread(KEY_TYPE, Value).init(alloc, &store, .{
+        .log_alive_message_interval_ms = 1000,
+    });
+    try t.start();
+
+    // TODO: add to test code: check for presence of files & their contents
+    std.time.sleep(5 * std.time.ns_per_s);
+    try store.upsert(alloc, 1, value_1);
+    std.time.sleep(5 * std.time.ns_per_s);
+    try store.upsert(alloc, 2, value_2);
+    std.time.sleep(5 * std.time.ns_per_s);
+
+    t.stopAndWait();
+    try std.fs.cwd().deleteTree(BASE_PATH);
+}

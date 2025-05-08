@@ -7,6 +7,12 @@
 pub const version = @import("version.zig").version() orelse "(unknown version)";
 pub const SaveThread = @import("savethread.zig").SaveThread;
 
+// for including tests in other modules:
+comptime {
+    _ = @import("savethread.zig");
+    _ = @import("persist.zig");
+}
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -233,7 +239,7 @@ pub fn Wrap(V: type) type {
     };
 }
 
-test "2" {
+test Store {
     const alloc = std.testing.allocator;
 
     var store = try Store(usize, usize).init(alloc, .default);
