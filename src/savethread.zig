@@ -75,6 +75,7 @@ pub fn SaveThread(K: type, V: type) type {
             defer self.arena_state.deinit();
 
             var last_alive_log_time: i64 = 0;
+            var last_collection_time: i128 = 0;
 
             while (!self.exit_signal.isSet()) {
                 _ = self.arena_state.reset(.retain_capacity); // we don't care if it went OK
@@ -88,6 +89,14 @@ pub fn SaveThread(K: type, V: type) type {
                 std.time.sleep(self.sleep_time_ms * std.time.ns_per_ms);
 
                 const collection_time = std.time.nanoTimestamp();
+
+                // let's honor the save_interval_seconds
+                if (collection_time < last_collection_time + self.save_interval_seconds * std.time.ns_per_s) {
+                    continue;
+                } else {
+                    last_collection_time = collection_time;
+                }
+
                 var dirty_values = std.ArrayListUnmanaged(DirtyItem).empty;
 
                 // iterate over all blobz objects and
