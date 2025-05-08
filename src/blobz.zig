@@ -182,7 +182,7 @@ pub fn Store(K: type, V: type) type {
                 // modify the value, because of _insert_mutex
                 gopResult.value_ptr.* = .{
                     ._dirty_time = std.time.nanoTimestamp(),
-                    ._collection_time = std.time.nanoTimestamp(), // never
+                    ._collection_time = 0, // never
                     .value = value,
                 };
             }
@@ -197,7 +197,7 @@ pub fn Store(K: type, V: type) type {
         pub fn upsertAssumeCapacity(self: *Self, key: K, value: V) !void {
             var wrapped: Wrap(V) = .{
                 ._dirty_time = std.time.nanoTimestamp(),
-                ._collection_time = std.time.nanoTimestamp(), // never
+                ._collection_time = 0, // never
                 .value = value,
             };
 
@@ -257,5 +257,5 @@ test Store {
     var vv = store.getValueFor(key, .reading) orelse unreachable;
     std.debug.print("NO DEADLOCK!!!\n", .{});
     defer vv.unlock();
-    std.debug.print("Value vv is: {d}\n", .{vv.value_ptr.*});
+    std.debug.print("Value vv is: {d}\n\n\n", .{vv.value_ptr.*});
 }

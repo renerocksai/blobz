@@ -220,10 +220,14 @@ pub fn SaveThread(K: type, V: type) type {
 
 // let's test this
 test Persistor {
+    const fsutils = @import("fsutils.zig");
+
     const alloc = std.testing.allocator;
 
+    // What goes into the store
     const KEY_TYPE = u16;
-    const BASE_PATH = ",,test_persistor";
+    const BASE_PATH = ",,test_save_thread";
+    const PREFIX = "u16store";
 
     const Value = struct {
         first_name: []const u8,
@@ -235,29 +239,50 @@ test Persistor {
         }
     };
 
+    // empty the directory just in case
+    try std.fs.cwd().deleteTree(BASE_PATH);
+
+    // the store
     var store = try blobz.Store(KEY_TYPE, Value).init(alloc, .{
-        .prefix = "u16store",
+        .prefix = PREFIX,
         .workdir = BASE_PATH,
         .initial_capacity = 1000,
-        .save_interval_seconds = 5,
+        .save_interval_seconds = 1,
     });
     defer store.deinit(alloc);
+    defer std.fs.cwd().deleteTree(BASE_PATH) catch unreachable;
 
+    // some values
     const value_1: Value = .{ .first_name = "rene", .last_name = "rocksai" };
     const value_2: Value = .{ .first_name = "your", .last_name = "mom" };
 
+    // start a save thread
     var t = SaveThread(KEY_TYPE, Value).init(alloc, &store, .{
         .log_alive_message_interval_ms = 1000,
     });
     try t.start();
+    defer t.stopAndWait();
 
-    // TODO: add to test code: check for presence of files & their contents
-    std.time.sleep(5 * std.time.ns_per_s);
+    // let's test
+    //
+    // time step 1: dir exists, but no files
+    std.time.sleep(store.opts.save_interval_seconds * std.time.ns_per_s);
+    try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
+    try std.testing.expectEqual(false, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
+    try std.testing.expectEqual(false, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
+
+    // time step 2: dir exists AND first file exists
     try store.upsert(alloc, 1, value_1);
-    std.time.sleep(5 * std.time.ns_per_s);
-    try store.upsert(alloc, 2, value_2);
-    std.time.sleep(5 * std.time.ns_per_s);
 
-    t.stopAndWait();
-    try std.fs.cwd().deleteTree(BASE_PATH);
+    std.time.sleep(store.opts.save_interval_seconds * std.time.ns_per_s);
+    try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
+    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
+    try std.testing.expectEqual(false, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
+
+    // time step 3: dir exists AND both files exist
+    try store.upsert(alloc, 2, value_2);
+    std.time.sleep(store.opts.save_interval_seconds * std.time.ns_per_s);
+    try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
+    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
+    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
 }
