@@ -197,7 +197,8 @@ pub fn SaveThread(K: type, V: type) type {
                     // !!!
 
                     persistor.persist(arena, dirty_item.key_ptr.*, dirty_item.wrapped_ptr.value) catch |err| {
-                        const file_path = persistor.persistor.filePath(arena, dirty_item.key_ptr.*) catch |suberr| {
+                        const id = persistor.hash(dirty_item.key_ptr.*);
+                        const file_path = persistor.persistor.filePath(arena, id) catch |suberr| {
                             log.err(
                                 "Unable to save, unable to get path for key {any}: {}",
                                 .{ dirty_item.key_ptr.*, suberr },
@@ -257,6 +258,7 @@ test SaveThread {
         .workdir = BASE_PATH,
         .initial_capacity = 1000,
         .save_interval_seconds = 1,
+        .log_alive_message_interval_ms = 1000,
     });
     defer store.deinit(alloc);
     defer std.fs.cwd().deleteTree(BASE_PATH) catch unreachable;

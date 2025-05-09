@@ -202,7 +202,7 @@ pub fn Persistor(comptime K: type, V: type) type {
     // Now wrap the NumericKeyPersistor:
     return struct {
         const is_int = meta.isInteger(K);
-        const ID = if (is_int) K else u64;
+        pub const ID = if (is_int) K else u64;
         const hasher: Hasher(K, ID) = if (is_int) .identity else .hashing;
 
         pub const KV = struct { key: K, value: V };

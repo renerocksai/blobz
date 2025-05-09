@@ -30,12 +30,25 @@ pub const Opts = struct {
     /// The working directory. Subdirs will be created from here on, starting
     /// with the `prefix` subdir.
     workdir: []const u8,
+    /// From SaveThread's Opts:
+    /// if > 0, logs that the thread is alive every n milliseconds.
+    /// Note: the accuracy is influenced by:
+    ///       - sleep_time_ms
+    ///       - locking_spin_time_ms (and locking_spin_max_count)
+    ///       - the current persistor load
+    ///
+    ///       While the thread is sleeping or busy persisting, it won't be able
+    ///       to check whether it should log an alive message.
+    ///       For simplicity and to avoid unnecessary wakeups from sleep,
+    ///       logging is done in the thread's main loop.
+    log_alive_message_interval_ms: i64,
 
     pub const default: Opts = .{
         .initial_capacity = 1000,
         .save_interval_seconds = 10,
         .prefix = "default",
         .workdir = "object_store",
+        .log_alive_message_interval_ms = 0,
     };
 
     pub fn format(
@@ -67,6 +80,8 @@ pub fn Store(K: type, V: type) type {
         _kv_store: KV_Store_Type,
         // dang. wish zig's hashmaps were threadsafe
         _insert_mutex: std.Thread.Mutex = .{},
+
+        persistor_thread: ?SaveThread(K, V),
 
         pub const Key_Type: type = K;
         pub const Value_Type: type = V;
@@ -119,18 +134,36 @@ pub fn Store(K: type, V: type) type {
                 .opts = opts,
                 .dest_path = dest_path,
                 ._kv_store = .empty,
+                .persistor_thread = null,
             };
             try ret.ensureCapacity(gpa, opts.initial_capacity);
             return ret;
         }
 
         pub fn deinit(self: *Self, gpa: Allocator) void {
+            if (self.persistor_thread) |*t| {
+                t.stopAndWait();
+            }
             gpa.free(self.dest_path);
             self._kv_store.deinit(gpa);
         }
 
         pub fn ensureCapacity(self: *Self, gpa: Allocator, capacity: usize) !void {
             try self._kv_store.ensureTotalCapacity(gpa, capacity);
+        }
+
+        pub fn startPersistorThread(self: *Self, gpa: Allocator) !void {
+            self.persistor_thread = SaveThread(K, V).init(gpa, self, .{
+                .log_alive_message_interval_ms = self.opts.log_alive_message_interval_ms,
+            });
+            try self.persistor_thread.?.start();
+        }
+
+        pub fn stopPersistorThread(self: *Self) void {
+            if (self.persistor_thread) |*t| {
+                t.stopAndWait();
+                self.persistor_thread = null;
+            }
         }
 
         const ErrorNotFound = error{NotFound};
@@ -241,6 +274,8 @@ pub fn Store(K: type, V: type) type {
             );
             defer base_dir.close();
             var walker = try base_dir.walk(trash_arena);
+            defer walker.deinit(); // it's trashed but still
+
             var error_files = std.ArrayListUnmanaged([]const u8).empty;
             defer error_files.deinit(trash_arena);
 
@@ -354,8 +389,14 @@ test "Load From Hashing Persistor" {
         .workdir = BASE_PATH,
         .initial_capacity = 1000,
         .save_interval_seconds = 1,
+        .log_alive_message_interval_ms = 1000,
     });
     defer store.deinit(gpa);
+    defer std.fs.cwd().deleteTree(BASE_PATH) catch unreachable;
+
+    // just for fun!
+    try store.startPersistorThread(gpa);
+    defer store.stopPersistorThread();
 
     const config = persist.Config.initDefault(KEY_TYPE, store.dest_path);
 
@@ -385,6 +426,4 @@ test "Load From Hashing Persistor" {
     defer read_value_2.unlock();
     try std.testing.expectEqualStrings(value_2.first_name, read_value_2.value_ptr.first_name);
     try std.testing.expectEqualStrings(value_2.last_name, read_value_2.value_ptr.last_name);
-
-    try std.fs.cwd().deleteTree(BASE_PATH);
 }
