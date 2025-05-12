@@ -166,6 +166,12 @@ pub fn Store(K: type, V: type) type {
             }
         }
 
+        pub fn count(self: *Self) usize {
+            self._insert_mutex.lock();
+            defer self._insert_mutex.unlock();
+            return self._kv_store.count();
+        }
+
         const ErrorNotFound = error{NotFound};
 
         /// call .unlock() on the returned RetrievedValue wrapper
@@ -426,4 +432,6 @@ test "Load From Hashing Persistor" {
     defer read_value_2.unlock();
     try std.testing.expectEqualStrings(value_2.first_name, read_value_2.value_ptr.first_name);
     try std.testing.expectEqualStrings(value_2.last_name, read_value_2.value_ptr.last_name);
+
+    try std.testing.expectEqual(2, store.count());
 }
