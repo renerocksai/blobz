@@ -80,9 +80,11 @@ pub fn SaveThread(K: type, V: type) type {
             while (!self.exit_signal.isSet()) {
                 _ = self.arena_state.reset(.retain_capacity); // we don't care if it went OK
 
-                if (std.time.milliTimestamp() + self.log_alive_message_interval_ms > last_alive_log_time) {
-                    log.info("alive.", .{});
-                    last_alive_log_time = std.time.milliTimestamp();
+                if (self.log_alive_message_interval_ms > 0) {
+                    if (std.time.milliTimestamp() + self.log_alive_message_interval_ms > last_alive_log_time) {
+                        log.info("alive.", .{});
+                        last_alive_log_time = std.time.milliTimestamp();
+                    }
                 }
 
                 // delay so we don't hog the CPU
