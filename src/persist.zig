@@ -245,8 +245,10 @@ pub fn Persistor(comptime K: type, V: type) type {
         pub fn loadFromPath(self: *Self, arena: Allocator, path: []const u8) !KV {
             const obj = try self.persistor.loadFromPath(arena, path);
             if (is_int) {
+                // strip extension
+                const id_str = std.fs.path.stem(std.fs.path.basename(path));
                 return .{
-                    .key = try std.fmt.parseInt(K, std.fs.path.basename(path), 16),
+                    .key = try std.fmt.parseInt(K, id_str, 16),
                     .value = obj,
                 };
             } else {
