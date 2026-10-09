@@ -1,63 +1,36 @@
 const std = @import("std");
 
-const build_zig_zon = @embedFile("build.zig.zon");
-
 pub fn build(b: *std.Build) void {
+    if (!std.mem.eql(u8, @import("builtin").zig_version_string, std.mem.trim(u8, @embedFile(".zig-version"), " \r\n")))
+        @panic("Use exactly Zig 0.17.0 from .zig-version");
     const target = b.standardTargetOptions(.{});
-
     const optimize = b.standardOptimizeOption(.{});
-
-    // we export this module
-    const lib_mod = b.addModule("blobz", .{
+    const module = b.addModule("blobz", .{
         .root_source_file = b.path("src/blobz.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const options = b.addOptions();
+    options.addOption([]const u8, "contents", @embedFile("build.zig.zon"));
+    module.addOptions("build.zig.zon", options);
 
-    const lib = b.addLibrary(.{
+    const library = b.addLibrary(.{
         .linkage = .static,
         .name = "blobz",
-        .root_module = lib_mod,
+        .root_module = module,
     });
+    b.installArtifact(library);
+    const tests = b.addTest(.{ .root_module = module });
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run persistence, ownership and saver tests");
+    test_step.dependOn(&run_tests.step);
 
-    b.installArtifact(lib);
-
-    // Make build.zig.zon accessible in module
-    var my_options = std.Build.Step.Options.create(b);
-    my_options.addOption([]const u8, "contents", build_zig_zon);
-    lib.root_module.addOptions("build.zig.zon", my_options);
-
-    // const exe_mod = b.createModule(.{
-    //     .root_source_file = b.path("examples/blah/main.zig"),
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
-    //
-    // exe_mod.addImport("blobz", lib_mod);
-    // const exe = b.addExecutable(.{
-    //     .name = "blobz",
-    //     .root_module = exe_mod,
-    // });
-    //
-    // b.installArtifact(exe);
-    //
-    // const run_cmd = b.addRunArtifact(exe);
-    //
-    // run_cmd.step.dependOn(b.getInstallStep());
-    //
-    // if (b.args) |args| {
-    //     run_cmd.addArgs(args);
-    // }
-    //
-    // const run_step = b.step("run", "Run the app");
-    // run_step.dependOn(&run_cmd.step);
-
-    const lib_unit_tests = b.addTest(.{
-        .root_module = lib_mod,
+    const format = b.addFmt(.{
+        .paths = b.pathList(&.{ "build.zig", "build.zig.zon", "src" }),
+        .check = true,
     });
-
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
-
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
+    const verify = b.step("verify", "Check formatting, compile the library and run every test");
+    verify.dependOn(&format.step);
+    verify.dependOn(&library.step);
+    verify.dependOn(&run_tests.step);
 }

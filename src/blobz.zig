@@ -14,6 +14,9 @@ const meta = @import("meta.zig");
 comptime {
     _ = @import("savethread.zig");
     _ = @import("persist.zig");
+    _ = @import("fsutils.zig");
+    _ = @import("meta.zig");
+    _ = @import("version.zig");
 }
 
 const std = @import("std");
@@ -53,12 +56,8 @@ pub const Opts = struct {
 
     pub fn format(
         self: Opts,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
+        writer: *std.Io.Writer,
     ) !void {
-        _ = fmt;
-        _ = options;
         try writer.print(
             ".{{.initial_capacity = {d}, .save_interval_seconds = {d}, .prefix = \"{s}\", .workdir = \"{s}\" }}",
             .{ self.initial_capacity, self.save_interval_seconds, self.prefix, self.workdir },
@@ -69,37 +68,36 @@ pub const Opts = struct {
 /// Create the Blobz object store.
 ///
 /// You own the keys. They are not copied or duped.
-/// Unmanaged: you provide an allocator when it's needed.
+/// The allocator passed to init owns the map and stable value wrappers.
+/// Keys and nested value allocations remain owned by the caller.
 ///
 /// Values that you read
 pub fn Store(K: type, V: type) type {
     return struct {
         opts: Opts = .default,
+        io: std.Io,
+        allocator: Allocator,
         dest_path: []const u8,
 
         _kv_store: KV_Store_Type,
         // dang. wish zig's hashmaps were threadsafe
-        _insert_mutex: std.Thread.Mutex = .{},
+        _insert_mutex: std.Io.Mutex = .init,
 
         persistor_thread: ?SaveThread(K, V),
 
         pub const Key_Type: type = K;
         pub const Value_Type: type = V;
         pub const WrappedValue_Type: type = Wrap(V);
-        pub const KV_Store_Type: type = if (meta.isSliceOf(K, u8)) std.StringArrayHashMapUnmanaged(Wrap(V)) else std.AutoArrayHashMapUnmanaged(K, Wrap(V));
+        pub const KV_Store_Type: type = if (meta.isSliceOf(K, u8)) std.StringArrayHashMapUnmanaged(*Wrap(V)) else std.AutoArrayHashMapUnmanaged(K, *Wrap(V));
 
         const Self = @This();
 
         pub fn format(
             self: *const Self,
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
+            writer: *std.Io.Writer,
         ) !void {
-            _ = fmt;
-            _ = options;
             try writer.print(
-                ".{{ .opts = {}, .dest_path = \"{s}\", ._kv_store={{.count = {d}, .capacity = {d}}}, }}",
+                ".{{ .opts = {f}, .dest_path = \"{s}\", ._kv_store={{.count = {d}, .capacity = {d}}}, }}",
                 .{ self.opts, self.dest_path, self._kv_store.count(), self._kv_store.capacity() },
             );
         }
@@ -110,32 +108,37 @@ pub fn Store(K: type, V: type) type {
         /// You must call ReadValue.unlock() when finished.
         pub const RetrievedValue = struct {
             _rw_mode: RetrieveMode,
-            _lock: *std.Thread.RwLock,
+            io: std.Io,
+            _lock: *std.Io.RwLock,
             value_ptr: *V,
 
             pub fn unlock(self: *RetrievedValue) void {
                 switch (self._rw_mode) {
-                    .reading => self._lock.unlockShared(),
-                    .writing => self._lock.unlock(),
+                    .reading => self._lock.unlockShared(self.io),
+                    .writing => self._lock.unlock(self.io),
                 }
             }
         };
         pub const RetrieveMode = enum { reading, writing };
 
-        pub fn init(gpa: Allocator, opts: Opts) !Self {
+        pub fn init(gpa: Allocator, io: std.Io, opts: Opts) !Self {
             // create the directory for the store
             const dest_path = try std.fs.path.join(gpa, &.{ opts.workdir, opts.prefix });
-            std.fs.cwd().makePath(dest_path) catch |err| {
+            errdefer gpa.free(dest_path);
+            std.Io.Dir.cwd().createDirPath(io, dest_path) catch |err| {
                 log.err("Unable to create destination path `{s}`: {}", .{ dest_path, err });
                 return err;
             };
 
             var ret: Self = .{
                 .opts = opts,
+                .io = io,
+                .allocator = gpa,
                 .dest_path = dest_path,
                 ._kv_store = .empty,
                 .persistor_thread = null,
             };
+            errdefer ret._kv_store.deinit(gpa);
             try ret.ensureCapacity(gpa, opts.initial_capacity);
             return ret;
         }
@@ -144,18 +147,25 @@ pub fn Store(K: type, V: type) type {
             if (self.persistor_thread) |*t| {
                 t.stopAndWait();
             }
-            gpa.free(self.dest_path);
-            self._kv_store.deinit(gpa);
+            _ = gpa;
+            self.allocator.free(self.dest_path);
+            for (self._kv_store.values()) |wrapped| self.allocator.destroy(wrapped);
+            self._kv_store.deinit(self.allocator);
         }
 
         pub fn ensureCapacity(self: *Self, gpa: Allocator, capacity: usize) !void {
-            try self._kv_store.ensureTotalCapacity(gpa, capacity);
+            _ = gpa;
+            self._insert_mutex.lockUncancelable(self.io);
+            defer self._insert_mutex.unlock(self.io);
+            try self._kv_store.ensureTotalCapacity(self.allocator, capacity);
         }
 
         pub fn startPersistorThread(self: *Self, gpa: Allocator) !void {
+            if (self.persistor_thread != null) return error.AlreadyStarted;
             self.persistor_thread = SaveThread(K, V).init(gpa, self, .{
                 .log_alive_message_interval_ms = self.opts.log_alive_message_interval_ms,
             });
+            errdefer self.persistor_thread = null;
             try self.persistor_thread.?.start();
         }
 
@@ -166,9 +176,32 @@ pub fn Store(K: type, V: type) type {
             }
         }
 
+        /// Synchronously persist dirty entries. Call after stopping request workers
+        /// and the saver for a final shutdown flush. It also safely serializes
+        /// with concurrent inserts, value updates, and background collections.
+        /// A failed write leaves that entry dirty and is returned to the caller.
+        pub fn flush(self: *Self) !void {
+            var scratch_state = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch_state.deinit();
+            const scratch = scratch_state.allocator();
+            var persistor = persist.Persistor(K, V).init(self.io, persist.Config.initDefault(K, self.dest_path));
+            self._insert_mutex.lockUncancelable(self.io);
+            defer self._insert_mutex.unlock(self.io);
+            var it = self._kv_store.iterator();
+            while (it.next()) |entry| {
+                const wrapped = entry.value_ptr.*;
+                wrapped._rw_lock.lockUncancelable(self.io);
+                defer wrapped._rw_lock.unlock(self.io);
+                if (wrapped._dirty_time < wrapped._collection_time) continue;
+                _ = scratch_state.reset(.retain_capacity);
+                try persistor.persist(scratch, entry.key_ptr.*, wrapped.value);
+                wrapped._collection_time = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+            }
+        }
+
         pub fn count(self: *Self) usize {
-            self._insert_mutex.lock();
-            defer self._insert_mutex.unlock();
+            self._insert_mutex.lockUncancelable(self.io);
+            defer self._insert_mutex.unlock(self.io);
             return self._kv_store.count();
         }
 
@@ -178,15 +211,16 @@ pub fn Store(K: type, V: type) type {
         /// use rw_mode .writing if you plan to modify any internals of the
         /// returned value
         pub fn getValueFor(self: *Self, k: K, rw_mode: RetrieveMode) ErrorNotFound!RetrievedValue {
-            self._insert_mutex.lock();
-            defer self._insert_mutex.unlock();
-            if (self._kv_store.getPtr(k)) |wrapped_ptr| {
+            self._insert_mutex.lockUncancelable(self.io);
+            defer self._insert_mutex.unlock(self.io);
+            if (self._kv_store.get(k)) |wrapped_ptr| {
                 switch (rw_mode) {
-                    .reading => wrapped_ptr._rw_lock.lockShared(),
-                    .writing => wrapped_ptr._rw_lock.lock(),
+                    .reading => wrapped_ptr._rw_lock.lockSharedUncancelable(self.io),
+                    .writing => wrapped_ptr._rw_lock.lockUncancelable(self.io),
                 }
                 return .{
                     ._lock = &wrapped_ptr._rw_lock,
+                    .io = self.io,
                     .value_ptr = &wrapped_ptr.value,
                     ._rw_mode = rw_mode,
                 };
@@ -196,6 +230,8 @@ pub fn Store(K: type, V: type) type {
         }
 
         pub fn exists(self: *Self, key: K) bool {
+            self._insert_mutex.lockUncancelable(self.io);
+            defer self._insert_mutex.unlock(self.io);
             return self._kv_store.contains(key);
         }
 
@@ -206,79 +242,60 @@ pub fn Store(K: type, V: type) type {
         /// if you modified a value returned by getValueFor(..., .writing),
         /// then make sure you call value.unlock() before calling upsert
         pub fn upsert(self: *Self, gpa: Allocator, key: K, value: V) !void {
-
-            // TODO: check if we can get away without
-            self._insert_mutex.lock();
-            defer self._insert_mutex.unlock();
-
-            const gopResult = try self._kv_store.getOrPut(gpa, key);
-            if (gopResult.found_existing) {
-                // we need to replace
-                // prevent reading and writing from/to this value while we replace
-                gopResult.value_ptr.*._rw_lock.lock();
-                defer gopResult.value_ptr.*._rw_lock.unlock();
-                gopResult.value_ptr.*._dirty_time = std.time.nanoTimestamp();
-                // we overwrite the value
-                gopResult.value_ptr.*.value = value;
-            } else {
-                // we need to insert:
-                // this is safe since lookups will not happen while we
-                // modify the value, because of _insert_mutex
-                gopResult.value_ptr.* = .{
-                    ._dirty_time = std.time.nanoTimestamp(),
-                    ._collection_time = 0, // never
-                    .value = value,
-                };
+            _ = gpa;
+            self._insert_mutex.lockUncancelable(self.io);
+            defer self._insert_mutex.unlock(self.io);
+            if (self._kv_store.get(key)) |wrapped| {
+                self.replace(wrapped, value);
+                return;
             }
-        }
-
-        /// For now, this is used to put in or replace values.
-        /// For the time of replacing an element with a new value, the
-        /// value will be write-locked
-        ///
-        /// if you modified a value returned by getValueFor(..., .writing),
-        /// then make sure you call value.unlock() before calling upsert
-        pub fn upsertAssumeCapacity(self: *Self, key: K, value: V) !void {
-            var wrapped: Wrap(V) = .{
-                ._dirty_time = std.time.nanoTimestamp(),
-                ._collection_time = 0, // never
+            const wrapped = try self.allocator.create(Wrap(V));
+            errdefer self.allocator.destroy(wrapped);
+            wrapped.* = .{
+                ._dirty_time = std.Io.Timestamp.now(self.io, .real).nanoseconds,
+                ._collection_time = 0,
                 .value = value,
             };
+            try self._kv_store.put(self.allocator, key, wrapped);
+        }
 
-            // if we insert, we insert locked
-            wrapped._rw_lock.lock();
+        fn replace(self: *Self, wrapped: *Wrap(V), value: V) void {
+            wrapped._rw_lock.lockUncancelable(self.io);
+            defer wrapped._rw_lock.unlock(self.io);
+            wrapped._dirty_time = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+            wrapped.value = value;
+        }
 
-            // TODO: check if we can get away without
-            self._insert_mutex.lock();
-            defer self._insert_mutex.unlock();
-
-            const gopResult = self._kv_store.getOrPutAssumeCapacity(wrapped, key);
-            if (gopResult.found_existing) {
-                // we need to replace
-                // prevent reading and writing from/to this value while we replace
-                gopResult.value_ptr.*._rw_lock.lock();
-                defer gopResult.value_ptr.*._rw_lock.unlock();
-                gopResult.value_ptr.*._dirty_time = std.time.nanoTimestamp();
-                // we overwrite the value
-                gopResult.value_ptr.*.value = value;
-            } else {
-                // we inserted
-                gopResult.value_ptr.*._rw_lock.unlock();
+        /// The map must have capacity; stable value storage can still allocate.
+        pub fn upsertAssumeCapacity(self: *Self, key: K, value: V) !void {
+            self._insert_mutex.lockUncancelable(self.io);
+            defer self._insert_mutex.unlock(self.io);
+            if (self._kv_store.get(key)) |wrapped| {
+                self.replace(wrapped, value);
+                return;
             }
+            const wrapped = try self.allocator.create(Wrap(V));
+            wrapped.* = .{
+                ._dirty_time = std.Io.Timestamp.now(self.io, .real).nanoseconds,
+                ._collection_time = 0,
+                .value = value,
+            };
+            self._kv_store.putAssumeCapacity(key, wrapped);
         }
 
         /// Try to load all files into the store, return an owned list of failed files
         pub fn loadFromDisk(self: *Self, trash_arena: Allocator, value_arena: Allocator) !?[][]const u8 {
             const config = persist.Config.initDefault(K, self.dest_path);
             const Persistor = persist.Persistor(K, V);
-            var persistor = Persistor.init(config);
+            var persistor = Persistor.init(self.io, config);
 
             // now iterate over all .json files in all subdirs
-            var base_dir = try std.fs.cwd().openDir(
+            var base_dir = try std.Io.Dir.cwd().openDir(
+                self.io,
                 self.dest_path,
                 .{ .iterate = true },
             );
-            defer base_dir.close();
+            defer base_dir.close(self.io);
             var walker = try base_dir.walk(trash_arena);
             defer walker.deinit(); // it's trashed but still
 
@@ -289,7 +306,7 @@ pub fn Store(K: type, V: type) type {
             //       can, in our usecase where we don't use symlinks or other
             //       stuff, even assume that there may be non-fatal errors?
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            while (try walker.next()) |entry| {
+            while (try walker.next(self.io)) |entry| {
                 // check if the path ends in `.json`
                 if (std.mem.endsWith(u8, entry.path, ".json")) {
                     const full_path = try std.fmt.bufPrint(
@@ -299,7 +316,7 @@ pub fn Store(K: type, V: type) type {
                     );
                     const kv: Persistor.KV = persistor.loadFromPath(value_arena, full_path) catch |err| {
                         log.err("Unable to load {s} : {}", .{ entry.path, err });
-                        try error_files.append(trash_arena, entry.path);
+                        try error_files.append(trash_arena, try trash_arena.dupe(u8, entry.path));
                         continue;
                     };
 
@@ -315,7 +332,7 @@ pub fn Store(K: type, V: type) type {
 // TODO: re-think this. Does it make values unnecessary large?
 pub fn Wrap(V: type) type {
     return struct {
-        _rw_lock: std.Thread.RwLock = .{},
+        _rw_lock: std.Io.RwLock = .init,
         /// nanotimestamp when item was modified
         _dirty_time: i128,
         /// nanotimestamp when item was last collected
@@ -329,7 +346,10 @@ pub fn Wrap(V: type) type {
 test "rw_lock: reading" {
     const alloc = std.testing.allocator;
 
-    var store = try Store(usize, usize).init(alloc, .default);
+    var opts = Opts.default;
+    opts.workdir = ",,test_read_locks";
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, opts.workdir) catch unreachable;
+    var store = try Store(usize, usize).init(alloc, std.testing.io, opts);
     defer store.deinit(alloc);
 
     const key: usize = 1;
@@ -348,7 +368,10 @@ test "rw_lock: reading" {
 test "string ids" {
     const alloc = std.testing.allocator;
 
-    var store = try Store([]const u8, usize).init(alloc, .default);
+    var opts = Opts.default;
+    opts.workdir = ",,test_string_ids";
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, opts.workdir) catch unreachable;
+    var store = try Store([]const u8, usize).init(alloc, std.testing.io, opts);
     defer store.deinit(alloc);
 
     const key = "hello";
@@ -390,7 +413,7 @@ test "Load From Hashing Persistor" {
     };
 
     // now, create the store and load it
-    var store = try Store(KEY_TYPE, Value).init(gpa, .{
+    var store = try Store(KEY_TYPE, Value).init(gpa, std.testing.io, .{
         .prefix = PREFIX,
         .workdir = BASE_PATH,
         .initial_capacity = 1000,
@@ -398,7 +421,7 @@ test "Load From Hashing Persistor" {
         .log_alive_message_interval_ms = 1000,
     });
     defer store.deinit(gpa);
-    defer std.fs.cwd().deleteTree(BASE_PATH) catch unreachable;
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, BASE_PATH) catch unreachable;
 
     // just for fun!
     try store.startPersistorThread(gpa);
@@ -407,7 +430,7 @@ test "Load From Hashing Persistor" {
     const config = persist.Config.initDefault(KEY_TYPE, store.dest_path);
 
     // persist some values
-    var persistor = persist.Persistor(KEY_TYPE, Value).init(config);
+    var persistor = persist.Persistor(KEY_TYPE, Value).init(std.testing.io, config);
 
     const value_1: Value = .{ .my_key_field = "user 1", .first_name = "rene", .last_name = "rocksai" };
     const value_2: Value = .{ .my_key_field = "user 2", .first_name = "your", .last_name = "mom" };
@@ -434,4 +457,94 @@ test "Load From Hashing Persistor" {
     try std.testing.expectEqualStrings(value_2.last_name, read_value_2.value_ptr.last_name);
 
     try std.testing.expectEqual(2, store.count());
+}
+
+test "retrieved value and lock survive map growth" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = ",,test_stable_values";
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch unreachable;
+    var opts = Opts.default;
+    opts.initial_capacity = 1;
+    opts.workdir = path;
+    var store = try Store(u64, u64).init(gpa, io, opts);
+    defer store.deinit(gpa);
+    try store.upsert(gpa, 1, 123);
+    var retrieved = try store.getValueFor(1, .reading);
+    defer retrieved.unlock();
+    const pointer = retrieved.value_ptr;
+    for (2..2048) |key| try store.upsert(gpa, key, key);
+    try std.testing.expectEqual(pointer, &store._kv_store.get(1).?.value);
+    try std.testing.expectEqual(123, retrieved.value_ptr.*);
+    try store.ensureCapacity(gpa, 4096);
+    try store.upsertAssumeCapacity(3000, 456);
+    try store.upsertAssumeCapacity(3000, 789);
+    var inserted = try store.getValueFor(3000, .reading);
+    defer inserted.unlock();
+    try std.testing.expectEqual(789, inserted.value_ptr.*);
+}
+
+test "persistor start stop is idempotent and can restart" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = ",,test_persistor_lifecycle";
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch unreachable;
+    var opts = Opts.default;
+    opts.workdir = path;
+    var store = try Store(u64, u64).init(gpa, io, opts);
+    defer store.deinit(gpa);
+    try store.startPersistorThread(gpa);
+    try std.testing.expectError(error.AlreadyStarted, store.startPersistorThread(gpa));
+    store.stopPersistorThread();
+    store.stopPersistorThread();
+    try store.startPersistorThread(gpa);
+    // deinit must stop and join before releasing the store and its directory.
+}
+
+test "flush persists last mutation without waiting for the save interval" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = ",,test_final_flush";
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch unreachable;
+    var opts = Opts.default;
+    opts.workdir = path;
+    opts.save_interval_seconds = 3600;
+    var store = try Store(u16, u64).init(gpa, io, opts);
+    defer store.deinit(gpa);
+    var saver = SaveThread(u16, u64).init(gpa, &store, .{ .sleep_time_ms = 3600 * 1000 });
+    try saver.start();
+    defer saver.stopAndWait();
+    try store.upsert(gpa, 1, 123);
+    try store.flush();
+    try store.upsert(gpa, 1, 456);
+    saver.stopAndWait();
+    try store.flush();
+    var persistor = persist.Persistor(u16, u64).init(io, persist.Config.initDefault(u16, store.dest_path));
+    try std.testing.expectEqual(456, try persistor.load(gpa, 1));
+}
+
+test "failed final flush retains dirty state and permits retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = ",,test_failed_flush";
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch unreachable;
+    var opts = Opts.default;
+    opts.workdir = path;
+    var store = try Store(u16, u64).init(gpa, io, opts);
+    defer store.deinit(gpa);
+    try store.upsert(gpa, 1, 123);
+    const blocking_file = try std.fs.path.join(gpa, &.{ store.dest_path, "00" });
+    defer gpa.free(blocking_file);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = blocking_file, .data = "not a directory" });
+    if (store.flush()) |_| {
+        return error.ExpectedPersistenceFailure;
+    } else |_| {}
+    try std.testing.expectEqual(0, store._kv_store.get(1).?._collection_time);
+    // A failed write must release both locks so a subsequent update can proceed.
+    try store.upsert(gpa, 1, 456);
+    try std.Io.Dir.cwd().deleteFile(io, blocking_file);
+    try store.flush();
+    var persistor = persist.Persistor(u16, u64).init(io, persist.Config.initDefault(u16, store.dest_path));
+    try std.testing.expectEqual(456, try persistor.load(gpa, 1));
+    try std.testing.expect(store._kv_store.get(1).?._collection_time >= store._kv_store.get(1).?._dirty_time);
 }

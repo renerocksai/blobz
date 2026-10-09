@@ -1,0 +1,50 @@
+name: Blobz Zig 0.17 CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zig-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - name: Install exact checksum-verified Zig
+        shell: bash
+        run: python tools/install-zig.py
+
+      - name: Verify persistence and ownership in Debug and Safe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/blobz-ci"
+          zig version | tee "$RUNNER_TEMP/blobz-ci/compiler.log"
+          zig build verify -Doptimize=debug -j2 --summary all 2>&1 | tee "$RUNNER_TEMP/blobz-ci/debug.log"
+          zig build verify -Doptimize=safe -j2 --summary all 2>&1 | tee "$RUNNER_TEMP/blobz-ci/safe.log"
+          test -z "$(git status --porcelain)"
+      - name: Upload verification logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blobz-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/blobz-ci
+          retention-days: 14
