@@ -36,7 +36,7 @@ pub const Config = struct {
         // Slice keys historically used their descriptor's memory width here.
         // Zig 0.17 has no logical bit size for slices; retain the existing shard
         // layout (four levels for string keys on a 64-bit target).
-        const bits = if (meta.isSlice(ID)) @sizeOf(ID) * 8 else @bitSizeOf(ID);
+        const bits = if (comptime meta.isSlice(ID)) @sizeOf(ID) * 8 else @bitSizeOf(ID);
         return switch (bits) {
             64 => 3,
             128 => 4,
