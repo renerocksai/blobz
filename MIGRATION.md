@@ -44,6 +44,12 @@ flushing the last mutation without waiting for a long save interval.
 
 ## Zig 0.17 review
 
+`Config.shard_levels_default` preserves slice descriptors' legacy physical
+memory width with `@sizeOf(K) * 8`, because slices have no logical `@bitSizeOf`
+in Zig 0.17. This keeps the existing four hashed-key shard levels on 64-bit
+hosts; the numeric key widths remain logical integer widths. Existing fixed
+path and legacy-file fixtures supply independent layout oracles.
+
 The reflection helpers use unchanged pointer size/child fields; no qualifier or
 field-index association is discarded. There are no `@bitCast` or `@hasDecl`
 consumers in these sources. All six source modules participate in the test

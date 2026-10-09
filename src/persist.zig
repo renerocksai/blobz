@@ -33,7 +33,11 @@ pub const Config = struct {
     /// Default shard levels based on the ID type.
     /// These defaults can be tuned; here we choose 3 for u64 and 4 for u128.
     pub fn shard_levels_default(ID: type) u8 {
-        return switch (@bitSizeOf(ID)) {
+        // Slice keys historically used their descriptor's memory width here.
+        // Zig 0.17 has no logical bit size for slices; retain the existing shard
+        // layout (four levels for string keys on a 64-bit target).
+        const bits = if (meta.isSlice(ID)) @sizeOf(ID) * 8 else @bitSizeOf(ID);
+        return switch (bits) {
             64 => 3,
             128 => 4,
             else => 2,
