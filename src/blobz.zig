@@ -179,7 +179,8 @@ pub fn Store(K: type, V: type) type {
         /// Synchronously persist dirty entries. Call after stopping request workers
         /// and the saver for a final shutdown flush. It also safely serializes
         /// with concurrent inserts, value updates, and background collections.
-        /// A failed write leaves that entry dirty and is returned to the caller.
+        /// Attempts every dirty entry. Failed writes remain dirty; the first
+        /// error is returned after the remaining entries have been attempted.
         pub fn flush(self: *Self) !void {
             var scratch_state = std.heap.ArenaAllocator.init(self.allocator);
             defer scratch_state.deinit();
@@ -187,6 +188,7 @@ pub fn Store(K: type, V: type) type {
             var persistor = persist.Persistor(K, V).init(self.io, persist.Config.initDefault(K, self.dest_path));
             self._insert_mutex.lockUncancelable(self.io);
             defer self._insert_mutex.unlock(self.io);
+            var first_error: ?anyerror = null;
             var it = self._kv_store.iterator();
             while (it.next()) |entry| {
                 const wrapped = entry.value_ptr.*;
@@ -194,9 +196,13 @@ pub fn Store(K: type, V: type) type {
                 defer wrapped._rw_lock.unlock(self.io);
                 if (wrapped._dirty_time < wrapped._collection_time) continue;
                 _ = scratch_state.reset(.retain_capacity);
-                try persistor.persist(scratch, entry.key_ptr.*, wrapped.value);
+                persistor.persist(scratch, entry.key_ptr.*, wrapped.value) catch |err| {
+                    if (first_error == null) first_error = err;
+                    continue;
+                };
                 wrapped._collection_time = std.Io.Timestamp.now(self.io, .real).nanoseconds;
             }
+            if (first_error) |err| return err;
         }
 
         pub fn count(self: *Self) usize {
@@ -523,7 +529,7 @@ test "flush persists last mutation without waiting for the save interval" {
     try std.testing.expectEqual(456, try persistor.load(gpa, 1));
 }
 
-test "failed final flush retains dirty state and permits retry" {
+test "failed first flush entry does not starve later entries and permits retry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const path = ",,test_failed_flush";
@@ -533,18 +539,32 @@ test "failed final flush retains dirty state and permits retry" {
     var store = try Store(u16, u64).init(gpa, io, opts);
     defer store.deinit(gpa);
     try store.upsert(gpa, 1, 123);
+    // ArrayHashMap iteration preserves insertion order. These later keys use
+    // different first-level shards, so the blocked 00 shard affects only key 1.
+    try store.upsert(gpa, 0x0100, 100);
+    try store.upsert(gpa, 0x0200, 200);
     const blocking_file = try std.fs.path.join(gpa, &.{ store.dest_path, "00" });
     defer gpa.free(blocking_file);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = blocking_file, .data = "not a directory" });
-    if (store.flush()) |_| {
+    const first_error = if (store.flush()) |_| {
         return error.ExpectedPersistenceFailure;
-    } else |_| {}
+    } else |err| err;
     try std.testing.expectEqual(0, store._kv_store.get(1).?._collection_time);
+    var persistor = persist.Persistor(u16, u64).init(io, persist.Config.initDefault(u16, store.dest_path));
+    try std.testing.expectEqual(100, try persistor.load(gpa, 0x0100));
+    try std.testing.expectEqual(200, try persistor.load(gpa, 0x0200));
+    for ([_]u16{ 0x0100, 0x0200 }) |key| {
+        const wrapped = store._kv_store.get(key).?;
+        try std.testing.expect(wrapped._collection_time >= wrapped._dirty_time);
+    }
     // A failed write must release both locks so a subsequent update can proceed.
     try store.upsert(gpa, 1, 456);
+    try store.upsert(gpa, 0x0100, 101);
+    try std.testing.expectError(first_error, store.flush());
+    try std.testing.expectEqual(101, try persistor.load(gpa, 0x0100));
+    try std.testing.expectEqual(0, store._kv_store.get(1).?._collection_time);
     try std.Io.Dir.cwd().deleteFile(io, blocking_file);
     try store.flush();
-    var persistor = persist.Persistor(u16, u64).init(io, persist.Config.initDefault(u16, store.dest_path));
     try std.testing.expectEqual(456, try persistor.load(gpa, 1));
     try std.testing.expect(store._kv_store.get(1).?._collection_time >= store._kv_store.get(1).?._dirty_time);
 }

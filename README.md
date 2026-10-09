@@ -34,7 +34,8 @@ Direct map access must hold `_insert_mutex` and respect value locks.
 
 Stop application work and return its borrows, call `stopPersistorThread()`, then
 `flush()` before `deinit(allocator)`. The flush persists the last update without
-waiting for the configured interval and returns failures. The saver wakes and
+waiting for the configured interval, attempts every dirty entry, and returns
+the first failure after trying the rest. The saver wakes and
 joins on stop; repeating stop is harmless. Failed writes remain dirty for retry.
 Writes replace JSON files directly; this is not a transactional or crash-durable
 store. Thread creation and I/O must stay outside an application's request I/O
@@ -42,4 +43,5 @@ loop.
 
 The tests cover numeric and hashed persistence, original JSON fixtures, stable
 borrows across growth, failed-write retry, background updates and saver
-stop/restart. Native platform qualification is recorded in MIGRATION.md.
+stop/restart. Loads accept JSON files up to and including `persist.max_file_size`
+(1 MiB by default). Native platform qualification is recorded in MIGRATION.md.

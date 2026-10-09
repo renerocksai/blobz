@@ -19,8 +19,11 @@ also receive explicit I/O. Existing `upsert(gpa, ...)`, `ensureCapacity(gpa, ...
 and `deinit(gpa)` signatures remain, but map and wrapper allocations always use
 the allocator from `init`; keys and nested values are still caller-owned.
 `RetrievedValue.unlock()` retains its signature and uses the captured I/O.
-`Store.flush()` synchronously writes dirty entries and returns failures; call it
-after stopping request workers and joining the saver for a final shutdown flush.
+`Store.flush()` synchronously attempts every dirty entry and returns the first
+failure after the loop; successful entries are collected and failures stay dirty
+for retry. Call it after stopping request workers and joining the saver for a
+final shutdown flush. Loading preserves the inclusive `persist.max_file_size`
+bound, including a non-overflowing translation of `maxInt(usize)`.
 Custom formatting uses the `{f}` formatter.
 
 Filesystem operations, locks, timestamps, and saver wakeups use `std.Io`.
@@ -39,7 +42,8 @@ Validation: run `zig build verify -Doptimize=debug` and
 `zig build verify -Doptimize=safe` with exact Zig 0.17.0. Tests cover
 existing numeric/hashed persistence and background saving, legacy JSON fixtures,
 map growth while a retrieved value holds a lock, saver shutdown/restart, and
-flushing the last mutation without waiting for a long save interval.
+flushing the last mutation without waiting for a long save interval, progress
+past a failed first entry, and actual filesystem loads at and above the limit.
 
 
 ## Zig 0.17 review

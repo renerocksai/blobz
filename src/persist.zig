@@ -10,6 +10,7 @@ const log = std.log.scoped(.persistor);
 
 const Allocator = std.mem.Allocator;
 
+/// Inclusive maximum JSON file size accepted while loading.
 pub var max_file_size: usize = 1024 * 1024;
 
 /// Configuration structure. Users may override shardLevels and bitsPerLevel.
@@ -159,7 +160,9 @@ pub fn NumericKeyPersistor(comptime ID: type, Value: type) type {
         }
 
         pub fn loadFromPath(self: *Self, arena: Allocator, path: []const u8) !Value {
-            const json_str = try std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_file_size));
+            // Dir.readFileAlloc's limit is exclusive. Saturation also handles
+            // maxInt(usize), which Io.Limit represents as unlimited.
+            const json_str = try std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_file_size +| 1));
             defer arena.free(json_str);
             return std.json.parseFromSliceLeaky(Value, arena, json_str, .{ .allocate = .alloc_always });
         }
@@ -405,6 +408,36 @@ test "legacy hashed JSON payload and numeric filename load unchanged" {
     const numeric_loaded = try numeric.loadFromPath(arena, numeric_path);
     try std.testing.expectEqual(42, numeric_loaded.key);
     try std.testing.expectEqualStrings("numeric", numeric_loaded.value.name);
+}
+
+test "filesystem loads accept the inclusive size bound and reject one byte over" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = ",,test_inclusive_file_size";
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch unreachable;
+    // Zig's standard test runner executes tests serially; restore this public
+    // setting before another test can use it.
+    const original_limit = max_file_size;
+    defer max_file_size = original_limit;
+    max_file_size = 16;
+    var persistor = NumericKeyPersistor(u16, []const u8).init(io, Config.initDefault(u16, path));
+    const exact = "12345678901234"; // JSON quotes make this exactly 16 bytes.
+    const over = "123456789012345"; // Valid JSON, exactly one byte over.
+    try persistor.persist(gpa, 1, exact);
+    try persistor.persist(gpa, 2, over);
+    const exact_path = try persistor.filePath(gpa, 1);
+    defer gpa.free(exact_path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, exact_path, gpa, .unlimited);
+    defer gpa.free(raw);
+    try std.testing.expectEqual(16, raw.len);
+    try std.testing.expectEqualStrings(exact, try persistor.load(arena, 1));
+    try std.testing.expectError(error.StreamTooLong, persistor.load(arena, 2));
+    // The largest public bound must not overflow when translated for std.Io.
+    max_file_size = std.math.maxInt(usize);
+    try std.testing.expectEqualStrings(over, try persistor.load(arena, 2));
 }
 
 fn expectPath(posix_path: []const u8, actual: []const u8) !void {
