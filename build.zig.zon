@@ -17,7 +17,7 @@
     // modify the field.
     .fingerprint = 0xf0b086913826fcde, // Changing this has security and trust implications.
 
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.17.0",
 
     .dependencies = .{
         // none so far
@@ -36,6 +36,8 @@
         "build.zig.zon",
         "src",
         "LICENSE",
-        //"README.md",
+        ".zig-version",
+        "README.md",
+        "MIGRATION.md",
     },
 }

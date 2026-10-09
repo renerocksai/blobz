@@ -27,205 +27,107 @@ const log = std.log.scoped(.save_thread);
 
 pub fn SaveThread(K: type, V: type) type {
     return struct {
-        save_interval_seconds: usize,
-        locking_spin_time_ms: usize,
-        locking_spin_max_count: usize,
-        log_alive_message_interval_ms: i64,
-        sleep_time_ms: usize,
         blobz_store: *blobz.Store(K, V),
-
-        thread: std.Thread = undefined,
-        exit_signal: std.Thread.ResetEvent = .{},
-
-        last_save_time: i128 = 0,
-
+        opts: Opts,
+        thread: ?std.Thread = null,
+        exit_signal: std.Io.Event = .unset,
         arena_state: ArenaAllocator,
 
         const Self = @This();
         const WrappedValue = blobz.Store(K, V).WrappedValue_Type;
-        const DirtyItem = struct { key_ptr: *const K, wrapped_ptr: *WrappedValue };
+        // Values have stable allocations; copy the key because map storage can move.
+        const DirtyItem = struct { key: K, wrapped_ptr: *WrappedValue };
 
         pub fn init(allocator: Allocator, blobz_store: *blobz.Store(K, V), opts: Opts) Self {
             return .{
                 .arena_state = ArenaAllocator.init(allocator),
                 .blobz_store = blobz_store,
-                .save_interval_seconds = blobz_store.opts.save_interval_seconds,
-                .sleep_time_ms = opts.sleep_time_ms,
-                .locking_spin_time_ms = opts.locking_spin_time_ms,
-                .locking_spin_max_count = opts.locking_spin_max_count,
-                .log_alive_message_interval_ms = opts.log_alive_message_interval_ms,
+                .opts = opts,
             };
         }
 
         pub fn start(self: *Self) !void {
+            if (self.thread != null) return error.AlreadyStarted;
+            self.exit_signal = .unset;
             self.thread = try std.Thread.spawn(.{}, Self.thread_main, .{self});
         }
 
         pub fn stop(self: *Self) void {
-            self.exit_signal.set();
+            self.exit_signal.set(self.blobz_store.io);
         }
 
         pub fn stopAndWait(self: *Self) void {
-            self.exit_signal.set();
-            self.thread.join();
+            self.stop();
+            if (self.thread) |thread| {
+                thread.join();
+                self.thread = null;
+                const allocator = self.arena_state.child_allocator;
+                self.arena_state.deinit();
+                self.arena_state = ArenaAllocator.init(allocator);
+            }
         }
 
-        fn thread_main(self: *Self) !void {
+        fn thread_main(self: *Self) void {
+            const io = self.blobz_store.io;
             const arena = self.arena_state.allocator();
-            defer self.arena_state.deinit();
-
             var last_alive_log_time: i64 = 0;
-            var last_collection_time: i128 = 0;
-
+            var last_collection_time: i96 = 0;
             while (!self.exit_signal.isSet()) {
-                _ = self.arena_state.reset(.retain_capacity); // we don't care if it went OK
-
-                if (self.log_alive_message_interval_ms > 0) {
-                    if (std.time.milliTimestamp() + self.log_alive_message_interval_ms > last_alive_log_time) {
-                        log.info("alive.", .{});
-                        last_alive_log_time = std.time.milliTimestamp();
-                    }
-                }
-
-                // delay so we don't hog the CPU
-                std.time.sleep(self.sleep_time_ms * std.time.ns_per_ms);
-
-                const collection_time = std.time.nanoTimestamp();
-
-                // let's honor the save_interval_seconds
-                if (collection_time < last_collection_time + self.save_interval_seconds * std.time.ns_per_s) {
-                    continue;
-                } else {
-                    last_collection_time = collection_time;
-                }
-
-                var dirty_values = std.ArrayListUnmanaged(DirtyItem).empty;
-
-                // iterate over all blobz objects and
+                self.exit_signal.waitTimeout(io, .{ .duration = .{
+                    .raw = .fromMilliseconds(@intCast(self.opts.sleep_time_ms)),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return,
+                };
+                if (self.exit_signal.isSet()) break;
+                _ = self.arena_state.reset(.retain_capacity);
+                const collection_time = std.Io.Timestamp.now(io, .real).nanoseconds;
+                const now_ms: i64 = @intCast(@divTrunc(collection_time, std.time.ns_per_ms));
+                if (self.opts.log_alive_message_interval_ms > 0 and
+                    now_ms >= last_alive_log_time + self.opts.log_alive_message_interval_ms)
                 {
-                    // stop the world - before doing anything else
-                    // FIXME: don't stop the world
-                    self.blobz_store._insert_mutex.lock();
-                    defer self.blobz_store._insert_mutex.unlock();
-
-                    // find the dirty ones and:
-                    //      - record, in a list, their addresses which is safe
-                    //        because they can't be deleted from the blobz
-                    //        store while the _insert_mutex is held.
-                    //
-                    //        Note that we currently don't even support
-                    //        deleting values in the blobz store anyway!
-                    //
-                    //      - acquire their write locks so they are protected
-                    //        from modification and deletion (which we don't
-                    //        support anyway).
-                    //
-                    //        This assumes that a future delete operation would
-                    //        wait on the value's rw lock before deletion and
-                    //        subsequent potential destruction to ensure no
-                    //        write / modify-transaction is currently underway.
-                    //
-                    //        Note: some expensive "upsert" or rather
-                    //        getValueFor(.writing) transaction even of a
-                    //        single value could delay this entire
-                    //        stop-the-world operation.
-                    //
-                    //      - speaking of deletion: we should probably just
-                    //        append to a `free`-list and do the deletion
-                    //        *here*? Which would upgrade this thread from a
-                    //        mere saving thread to a maintenance thread.
-                    //
-                    //      - By using a free-list, we don't need as much
-                    //        locking; at least, that is the idea.
-                    //
-
+                    log.info("alive.", .{});
+                    last_alive_log_time = now_ms;
+                }
+                if (collection_time < last_collection_time + self.blobz_store.opts.save_interval_seconds * std.time.ns_per_s) continue;
+                last_collection_time = collection_time;
+                var dirty_values: std.ArrayList(DirtyItem) = .empty;
+                {
+                    self.blobz_store._insert_mutex.lockUncancelable(io);
+                    defer self.blobz_store._insert_mutex.unlock(io);
                     var it = self.blobz_store._kv_store.iterator();
-
                     while (it.next()) |entry| {
-                        if (entry.value_ptr._dirty_time >= entry.value_ptr._collection_time) {
-                            // we "soft-spin" (with sleep) here with tryLock()
-                            // and give up if it takes too long.
-                            var locking_spin_count: usize = 0;
-                            const is_locked: bool = blk: {
-                                while (!entry.value_ptr._rw_lock.tryLock()) {
-                                    locking_spin_count += 1;
-                                    if (locking_spin_count >= self.locking_spin_max_count) {
-                                        break :blk false;
-                                    }
-                                    std.time.sleep(self.locking_spin_time_ms);
-                                }
-                                break :blk true;
-                            };
-
-                            if (!is_locked) {
-                                log.warn(
-                                    "Item with key {any} could not be locked -> giving it up!",
-                                    .{entry.key_ptr.*},
-                                );
+                        const wrapped = entry.value_ptr.*;
+                        // Do not inspect timestamps until the value lock is held.
+                        var attempts: usize = 0;
+                        while (!wrapped._rw_lock.tryLock(io)) {
+                            attempts += 1;
+                            if (attempts >= self.opts.locking_spin_max_count) break;
+                            io.sleep(.fromMilliseconds(@intCast(self.opts.locking_spin_time_ms)), .awake) catch break;
+                        } else {
+                            if (wrapped._dirty_time >= wrapped._collection_time) {
+                                dirty_values.append(arena, .{ .key = entry.key_ptr.*, .wrapped_ptr = wrapped }) catch {
+                                    wrapped._rw_lock.unlock(io);
+                                    break;
+                                };
                                 continue;
                             }
-
-                            entry.value_ptr._collection_time = collection_time;
-                            dirty_values.append(arena, .{ .key_ptr = entry.key_ptr, .wrapped_ptr = entry.value_ptr }) catch |err| {
-                                log.err(
-                                    "Unable to insert item with key {any} into dirty_list! {}",
-                                    .{ entry.key_ptr.*, err },
-                                );
-                                // try later
-                                break;
-                            };
+                            wrapped._rw_lock.unlock(io);
                         }
                     }
                 }
-
-                //
-                // _insert_mutex is now unlocked. world can continue.
-                //
-
-                // now we can safely iterate over the dirty_list and "slowly"
-                // persist them :-)
-                // then, release their _rw_lock
-                //
-                // so, let's start with initializing the persistor
-
                 const config = persist.Config.initDefault(K, self.blobz_store.dest_path);
-                var persistor = persist.Persistor(K, V).init(config);
-                var num_saved: usize = 0;
-
-                for (dirty_values.items) |dirty_item| {
-                    // !!!
-                    // !!! unlock the item when done!
-                    defer dirty_item.wrapped_ptr._rw_lock.unlock();
-                    // !!!
-
-                    persistor.persist(arena, dirty_item.key_ptr.*, dirty_item.wrapped_ptr.value) catch |err| {
-                        const id = persistor.hash(dirty_item.key_ptr.*);
-                        const file_path = persistor.persistor.filePath(arena, id) catch |suberr| {
-                            log.err(
-                                "Unable to save, unable to get path for key {any}: {}",
-                                .{ dirty_item.key_ptr.*, suberr },
-                            );
-                            continue;
-                        };
-                        log.err(
-                            "Unable to persist value with key {any} to {s}: {}",
-                            .{ dirty_item.key_ptr.*, file_path, err },
-                        );
-                        continue;
+                var persistor = persist.Persistor(K, V).init(io, config);
+                for (dirty_values.items) |item| {
+                    defer item.wrapped_ptr._rw_lock.unlock(io);
+                    persistor.persist(arena, item.key, item.wrapped_ptr.value) catch |err| {
+                        log.err("Unable to persist key {any}: {}", .{ item.key, err });
+                        continue; // Keep it dirty so the next collection retries.
                     };
-                    num_saved += 1;
+                    item.wrapped_ptr._collection_time = collection_time;
                 }
-
-                if (num_saved > 0) {
-                    log.debug(
-                        "Saved {} out of {} dirty values",
-                        .{ num_saved, dirty_values.items.len },
-                    );
-                }
-
-                // end of big while loop
             }
-            log.debug("About to terminate", .{});
         }
     };
 }
@@ -235,6 +137,7 @@ test SaveThread {
     const fsutils = @import("fsutils.zig");
 
     const alloc = std.testing.allocator;
+    const io = std.testing.io;
 
     // What goes into the store
     const KEY_TYPE = u16;
@@ -252,10 +155,10 @@ test SaveThread {
     };
 
     // empty the directory just in case
-    try std.fs.cwd().deleteTree(BASE_PATH);
+    try std.Io.Dir.cwd().deleteTree(io, BASE_PATH);
 
     // the store
-    var store = try blobz.Store(KEY_TYPE, Value).init(alloc, .{
+    var store = try blobz.Store(KEY_TYPE, Value).init(alloc, io, .{
         .prefix = PREFIX,
         .workdir = BASE_PATH,
         .initial_capacity = 1000,
@@ -263,7 +166,7 @@ test SaveThread {
         .log_alive_message_interval_ms = 1000,
     });
     defer store.deinit(alloc);
-    defer std.fs.cwd().deleteTree(BASE_PATH) catch unreachable;
+    defer std.Io.Dir.cwd().deleteTree(io, BASE_PATH) catch unreachable;
 
     // some values
     const value_1: Value = .{ .first_name = "rene", .last_name = "rocksai" };
@@ -279,36 +182,34 @@ test SaveThread {
     // let's test
     //
     // time step 1: dir exists, but no files
-    std.time.sleep(store.opts.save_interval_seconds * std.time.ns_per_s);
-    try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
-    try std.testing.expectEqual(false, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
-    try std.testing.expectEqual(false, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
+    try io.sleep(.fromMilliseconds(@intCast((store.opts.save_interval_seconds + 1) * 1000)), .awake);
+    try std.testing.expectEqual(true, fsutils.isDirPresent(io, BASE_PATH ++ "/" ++ PREFIX));
+    try std.testing.expectEqual(false, fsutils.fileExists(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
+    try std.testing.expectEqual(false, fsutils.fileExists(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
 
     // time step 2: dir exists AND first file exists
     try store.upsert(alloc, 1, value_1);
 
-    std.time.sleep(store.opts.save_interval_seconds * std.time.ns_per_s);
-    try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
-    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
-    try std.testing.expectEqual(false, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
+    try io.sleep(.fromMilliseconds(@intCast((store.opts.save_interval_seconds + 1) * 1000)), .awake);
+    try std.testing.expectEqual(true, fsutils.isDirPresent(io, BASE_PATH ++ "/" ++ PREFIX));
+    try std.testing.expectEqual(true, fsutils.fileExists(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
+    try std.testing.expectEqual(false, fsutils.fileExists(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
 
     // time step 3: dir exists AND both files exist
     try store.upsert(alloc, 2, value_2);
-    std.time.sleep(store.opts.save_interval_seconds * std.time.ns_per_s);
-    try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
-    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
-    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
+    try io.sleep(.fromMilliseconds(@intCast((store.opts.save_interval_seconds + 1) * 1000)), .awake);
+    try std.testing.expectEqual(true, fsutils.isDirPresent(io, BASE_PATH ++ "/" ++ PREFIX));
+    try std.testing.expectEqual(true, fsutils.fileExists(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
+    try std.testing.expectEqual(true, fsutils.fileExists(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
 
     // time step 4: update a value, and check if its file contents reflect the change
     value_2.first_name = "my";
     try store.upsert(alloc, 2, value_2);
-    std.time.sleep(store.opts.save_interval_seconds * std.time.ns_per_s);
-    try std.testing.expectEqual(true, fsutils.isDirPresent(BASE_PATH ++ "/" ++ PREFIX));
-    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
-    try std.testing.expectEqual(true, fsutils.fileExists(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
-    var file = try std.fs.cwd().openFile(BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json", .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(alloc, 1024);
+    try io.sleep(.fromMilliseconds(@intCast((store.opts.save_interval_seconds + 1) * 1000)), .awake);
+    try std.testing.expectEqual(true, fsutils.isDirPresent(io, BASE_PATH ++ "/" ++ PREFIX));
+    try std.testing.expectEqual(true, fsutils.fileExists(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/01/0001.json"));
+    try std.testing.expectEqual(true, fsutils.fileExists(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json"));
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, BASE_PATH ++ "/" ++ PREFIX ++ "/00/02/0002.json", alloc, .limited(1024));
     defer alloc.free(content);
     var parsed = try std.json.parseFromSlice(Value, alloc, content, .{});
     defer parsed.deinit();

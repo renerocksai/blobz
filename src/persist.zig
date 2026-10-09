@@ -10,6 +10,7 @@ const log = std.log.scoped(.persistor);
 
 const Allocator = std.mem.Allocator;
 
+/// Inclusive maximum JSON file size accepted while loading.
 pub var max_file_size: usize = 1024 * 1024;
 
 /// Configuration structure. Users may override shardLevels and bitsPerLevel.
@@ -33,7 +34,11 @@ pub const Config = struct {
     /// Default shard levels based on the ID type.
     /// These defaults can be tuned; here we choose 3 for u64 and 4 for u128.
     pub fn shard_levels_default(ID: type) u8 {
-        return switch (@bitSizeOf(ID)) {
+        // Slice keys historically used their descriptor's memory width here.
+        // Zig 0.17 has no logical bit size for slices; retain the existing shard
+        // layout (four levels for string keys on a 64-bit target).
+        const bits = if (comptime meta.isSlice(ID)) @sizeOf(ID) * 8 else @bitSizeOf(ID);
+        return switch (bits) {
             64 => 3,
             128 => 4,
             else => 2,
@@ -60,11 +65,13 @@ pub fn NumericKeyPersistor(comptime ID: type, Value: type) type {
         pub const Self = @This();
 
         config: Config,
+        io: std.Io,
 
         /// Initialize the persistor with a given config.
-        pub fn init(config: Config) Self {
+        pub fn init(io: std.Io, config: Config) Self {
             return .{
                 .config = config,
+                .io = io,
             };
         }
 
@@ -93,6 +100,7 @@ pub fn NumericKeyPersistor(comptime ID: type, Value: type) type {
             // Finally: the filename, composed of the remaining hex digits plus ".json".
             const seg_count: usize = self.config.shard_levels + 2;
             var segments = try gpa.alloc([]const u8, seg_count);
+            defer gpa.free(segments);
             segments[0] = self.config.base_path;
 
             // For each shard level, use the corresponding slice of key_hex.
@@ -118,7 +126,6 @@ pub fn NumericKeyPersistor(comptime ID: type, Value: type) type {
 
             // Join segments into a complete path.
             const fullPath = try std.fs.path.join(gpa, segments);
-            gpa.free(segments);
             return fullPath; // already duped by std.fs.path.join
         }
 
@@ -130,34 +137,34 @@ pub fn NumericKeyPersistor(comptime ID: type, Value: type) type {
             defer gpa.free(path);
 
             const dirPath = std.fs.path.dirname(path) orelse return error.NoDirName;
-            std.fs.cwd().makePath(dirPath) catch |err| {
+            std.Io.Dir.cwd().createDirPath(self.io, dirPath) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
 
-            const json_str = try std.json.stringifyAlloc(gpa, value, .{});
+            const json_str = try std.json.Stringify.valueAlloc(gpa, value, .{});
+            defer gpa.free(json_str);
 
             // TODO: maybe use a buffered writer here
-            const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-            defer file.close();
-            try file.writeAll(json_str);
-            gpa.free(json_str);
+            const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
+            defer file.close(self.io);
+            var buffer: [4096]u8 = undefined;
+            var writer = file.writer(self.io, &buffer);
+            try writer.interface.writeAll(json_str);
+            try writer.interface.flush();
         }
 
         pub fn load(self: *Self, arena: Allocator, id: ID) !Value {
             const path = try self.filePath(arena, id);
+            defer arena.free(path);
             return self.loadFromPath(arena, path);
         }
 
-        pub fn loadFromPath(_: *Self, arena: Allocator, path: []const u8) !Value {
-            // TODO: maybe use BufferedReader
-
-            var file = try std.fs.cwd().openFile(path, .{});
-            defer file.close();
-
-            const json_str = try file.readToEndAlloc(arena, max_file_size);
-
-            const ret = std.json.parseFromSliceLeaky(Value, arena, json_str, .{ .allocate = .alloc_always });
-            return ret;
+        pub fn loadFromPath(self: *Self, arena: Allocator, path: []const u8) !Value {
+            // Dir.readFileAlloc's limit is exclusive. Saturation also handles
+            // maxInt(usize), which Io.Limit represents as unlimited.
+            const json_str = try std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_file_size +| 1));
+            defer arena.free(json_str);
+            return std.json.parseFromSliceLeaky(Value, arena, json_str, .{ .allocate = .alloc_always });
         }
     };
 }
@@ -213,8 +220,8 @@ pub fn Persistor(comptime K: type, V: type) type {
 
         persistor: NumIdPersistor,
 
-        pub fn init(config: Config) Self {
-            return .{ .persistor = NumIdPersistor.init(config) };
+        pub fn init(io: std.Io, config: Config) Self {
+            return .{ .persistor = NumIdPersistor.init(io, config) };
         }
 
         pub fn persist(self: *Self, gpa: std.mem.Allocator, key: K, value: V) !void {
@@ -281,16 +288,16 @@ test Persistor {
 
     const value_1: Value = .{ .first_name = "rene", .last_name = "rocksai" };
     const value_2: Value = .{ .first_name = "your", .last_name = "mom" };
-    var persistor = Persistor(KEY_TYPE, Value).init(config);
+    var persistor = Persistor(KEY_TYPE, Value).init(std.testing.io, config);
     try persistor.persist(gpa, 1, value_1);
     const file_1_path = try persistor.persistor.filePath(gpa, 1);
     defer gpa.free(file_1_path);
-    try std.testing.expectEqualStrings(BASE_PATH ++ "/00/01/0001.json", file_1_path);
+    try expectPath(BASE_PATH ++ "/00/01/0001.json", file_1_path);
 
     try persistor.persist(gpa, 2, value_2);
     const file_2_path = try persistor.persistor.filePath(gpa, 2);
     defer gpa.free(file_2_path);
-    try std.testing.expectEqualStrings(BASE_PATH ++ "/00/02/0002.json", file_2_path);
+    try expectPath(BASE_PATH ++ "/00/02/0002.json", file_2_path);
 
     const read_value_1 = try persistor.load(arena, 1);
     defer read_value_1.deinit(arena);
@@ -302,7 +309,7 @@ test Persistor {
     try std.testing.expectEqualStrings(value_2.first_name, read_value_2.first_name);
     try std.testing.expectEqualStrings(value_2.last_name, read_value_2.last_name);
 
-    try std.fs.cwd().deleteTree(BASE_PATH);
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, BASE_PATH);
 }
 
 test "Hashing Persistor" {
@@ -328,7 +335,7 @@ test "Hashing Persistor" {
         }
     };
 
-    var persistor = Persistor(KEY_TYPE, Value).init(config);
+    var persistor = Persistor(KEY_TYPE, Value).init(std.testing.io, config);
 
     // value 1
     {
@@ -343,7 +350,7 @@ test "Hashing Persistor" {
 
         const file_1_path = try persistor.persistor.filePath(gpa, file_1_hash);
         defer gpa.free(file_1_path);
-        try std.testing.expectEqualStrings(BASE_PATH ++ "/31/47/3c/89/31473c89de0732bc.json", file_1_path);
+        try expectPath(BASE_PATH ++ "/31/47/3c/89/31473c89de0732bc.json", file_1_path);
 
         const read_value_1 = try persistor.load(arena, value_1.my_key_field);
         defer read_value_1.deinit(arena);
@@ -362,7 +369,7 @@ test "Hashing Persistor" {
 
         const file_2_path = try persistor.persistor.filePath(gpa, file_2_hash);
         defer gpa.free(file_2_path);
-        try std.testing.expectEqualStrings(BASE_PATH ++ "/82/57/bd/c0/8257bdc0e590ad97.json", file_2_path);
+        try expectPath(BASE_PATH ++ "/82/57/bd/c0/8257bdc0e590ad97.json", file_2_path);
 
         const read_value_2 = try persistor.load(arena, value_2.my_key_field);
         defer read_value_2.deinit(arena);
@@ -370,5 +377,74 @@ test "Hashing Persistor" {
         try std.testing.expectEqualStrings(value_2.last_name, read_value_2.last_name);
     }
 
-    try std.fs.cwd().deleteTree(BASE_PATH);
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, BASE_PATH);
+}
+
+test "legacy hashed JSON payload and numeric filename load unchanged" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = ",,test_legacy_payload";
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch unreachable;
+    const Value = struct { name: []const u8 };
+    var strings = Persistor([]const u8, Value).init(io, Config.initDefault([]const u8, path));
+    const file_path = try strings.persistor.filePath(gpa, strings.hash("user 1"));
+    defer gpa.free(file_path);
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(file_path).?);
+    const fixture = "{\"key\":\"user 1\",\"value\":{\"name\":\"legacy\"}}";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = fixture });
+    const loaded = try strings.load(arena, "user 1");
+    try std.testing.expectEqualStrings("legacy", loaded.name);
+    try strings.persist(gpa, "user 1", loaded);
+    const rewritten = try std.Io.Dir.cwd().readFileAlloc(io, file_path, gpa, .limited(1024));
+    defer gpa.free(rewritten);
+    try std.testing.expectEqualStrings(fixture, rewritten);
+    var numeric = Persistor(u16, Value).init(io, Config.initDefault(u16, path));
+    const numeric_path = path ++ "/00/2a/002a.json";
+    try std.Io.Dir.cwd().createDirPath(io, path ++ "/00/2a");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = numeric_path, .data = "{\"name\":\"numeric\"}" });
+    const numeric_loaded = try numeric.loadFromPath(arena, numeric_path);
+    try std.testing.expectEqual(42, numeric_loaded.key);
+    try std.testing.expectEqualStrings("numeric", numeric_loaded.value.name);
+}
+
+test "filesystem loads accept the inclusive size bound and reject one byte over" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = ",,test_inclusive_file_size";
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch unreachable;
+    // Zig's standard test runner executes tests serially; restore this public
+    // setting before another test can use it.
+    const original_limit = max_file_size;
+    defer max_file_size = original_limit;
+    max_file_size = 16;
+    var persistor = NumericKeyPersistor(u16, []const u8).init(io, Config.initDefault(u16, path));
+    const exact = "12345678901234"; // JSON quotes make this exactly 16 bytes.
+    const over = "123456789012345"; // Valid JSON, exactly one byte over.
+    try persistor.persist(gpa, 1, exact);
+    try persistor.persist(gpa, 2, over);
+    const exact_path = try persistor.filePath(gpa, 1);
+    defer gpa.free(exact_path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, exact_path, gpa, .unlimited);
+    defer gpa.free(raw);
+    try std.testing.expectEqual(16, raw.len);
+    try std.testing.expectEqualStrings(exact, try persistor.load(arena, 1));
+    try std.testing.expectError(error.StreamTooLong, persistor.load(arena, 2));
+    // The largest public bound must not overflow when translated for std.Io.
+    max_file_size = std.math.maxInt(usize);
+    try std.testing.expectEqualStrings(over, try persistor.load(arena, 2));
+}
+
+fn expectPath(posix_path: []const u8, actual: []const u8) !void {
+    const expected = try std.testing.allocator.dupe(u8, posix_path);
+    defer std.testing.allocator.free(expected);
+    for (expected) |*byte| if (byte.* == '/') {
+        byte.* = std.fs.path.sep;
+    };
+    try std.testing.expectEqualStrings(expected, actual);
 }

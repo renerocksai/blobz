@@ -1,3 +1,4 @@
 .zig-cache
 zig-out
 object_store/
+zig-pkg/
