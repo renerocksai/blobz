@@ -39,6 +39,16 @@ assert subprocess.check_output([str(compiler), "version"], text=True).strip() ==
 with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as path:
     path.write(str(compiler.parent) + "\n")
 result = {"zig": version, "compiler": str(compiler), "platform": platform.platform(), "machine": platform.machine(), "windows_build": platform.win32_ver(), "runner_image": os.environ.get("ImageVersion"), "archive_sha256": artifact["shasum"], "revision": os.environ.get("GITHUB_SHA")}
+result["uname"] = dict(platform.uname()._asdict())
+result["checkout_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+result["checkout_tree"] = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True).strip()
+result["event"] = os.environ.get("GITHUB_EVENT_NAME")
+if os_name == "linux":
+    result["os_release"] = platform.freedesktop_os_release()
+if os_name == "windows":
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+        result["windows_registry"] = {name: winreg.QueryValueEx(key, name)[0] for name in ("CurrentBuildNumber", "UBR", "DisplayVersion", "EditionID")}
 packet = Path(os.environ["RUNNER_TEMP"]) / "blobz-ci"
 packet.mkdir(exist_ok=True)
 (packet / "environment.json").write_text(json.dumps(result, indent=2) + "\n")

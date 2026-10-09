@@ -56,5 +56,26 @@ consumers in these sources. All six source modules participate in the test
 root. `verify` checks formatting, builds the exported static library and runs
 all tests. Native path fixture expectations follow the target separator.
 
-The current port's platform results will be recorded after the named gates run.
-Earlier Zig 0.16 application results do not qualify this compiler upgrade.
+## Native verification — 2026-10-09
+
+At code revision `2abb0294584af4d7a0a8f718ba650e3c820cbc47`,
+[publication CI](https://github.com/renerocksai/blobz/actions/runs/37941260055)
+passed exact Zig 0.17.0 `zig build verify` in Debug and Safe on every host below.
+Each mode passed all 6 build steps and all 11 tests, including legacy hashed
+paths/JSON, borrowed values across growth, saver stop/restart and failed-flush
+retry. These are native execution results, with separate platform packets.
+
+| Native host | Environment recorded in the packet |
+| --- | --- |
+| macOS ARM64 | macOS 26.6.2; runner image `20260907.0351.1` |
+| Linux x86-64 | kernel `6.17.0-1022-azure`, glibc 2.39; image `20261004.327.1` |
+| Windows x86-64 | Windows Server 2025, build `10.0.26100`; image `20260925.250.1` |
+
+The first compile identified the removed logical slice bit size; the initial
+repair then needed an explicit compile-time type branch. Both failed attempts
+remain attached to their original CI revisions. The final branch preserves the
+legacy layout rather than substituting the 64-bit hash width for slice-key
+configuration. Additional registry/kernel metadata is captured by subsequent
+workflow runs. Earlier Zig 0.16 application results remain historical evidence.
+No performance, crash-durability, or arbitrary application-isolation claim is
+made by these correctness gates.
